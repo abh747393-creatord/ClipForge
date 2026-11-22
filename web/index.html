@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ClipForge</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="side-head">
+      <div class="logo">Clip<span>Forge</span></div>
+      <div class="status-dot" id="statusDot" title="checking…"></div>
+    </div>
+    <nav class="nav">
+      <button class="nav-item on" data-view="new">＋ New Job</button>
+      <button class="nav-item" data-view="library">▦ Library</button>
+      <button class="nav-item" data-view="live">● Live</button>
+      <button class="nav-item" data-view="settings">⚙ Settings</button>
+    </nav>
+    <div class="side-foot" id="sideStatus">connecting…</div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <h1 id="viewTitle">New Job</h1>
+      <div class="topbar-sub" id="viewSub">Paste a link or drop a video — get captioned clips.</div>
+    </div>
+
+    <!-- ============ NEW JOB ============ -->
+    <section class="view" id="view-new">
+      <div class="card">
+        <label class="field-label" for="urlInput">Video link (YouTube / Twitch / Kick)</label>
+        <input id="urlInput" type="url" placeholder="https://www.youtube.com/watch?v=…" autocomplete="off">
+        <div class="dropzone" id="dropzone" tabindex="0">
+          <b>or upload a video</b>
+          <span>click to choose, or drag &amp; drop — .mp4 .mov .mkv .webm</span>
+          <span class="dz-file" id="dzFile"></span>
+          <input id="fileInput" type="file" accept=".mp4,.mov,.mkv,.webm" hidden>
+        </div>
+        <div class="discover">
+          <label class="field-label" for="discoverTopic">…or find a stream to clip</label>
+          <div class="row">
+            <input id="discoverTopic" type="text" placeholder="Topic, e.g. GTA 6" autocomplete="off">
+            <select id="discoverWhen">
+              <option value="hour">Last hour</option>
+              <option value="today" selected>Today</option>
+              <option value="week">This week</option>
+              <option value="month">This month</option>
+            </select>
+            <button class="btn" id="discoverBtn" type="button">🔍 Find streams</button>
+          </div>
+          <div id="discoverResults"></div>
+          <div class="hint">Searches YouTube (long videos, most viewed) plus creators on your watchlist (Settings).</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Clips</h3>
+        <div class="grid3">
+          <label>How many clips
+            <input id="optCount" type="number" min="1" max="12" step="1" value="4">
+          </label>
+          <label>Min length (s)
+            <input id="optMinLen" type="number" min="5" max="120" step="1" value="15">
+          </label>
+          <label>Max length (s)
+            <input id="optMaxLen" type="number" min="10" max="180" step="1" value="60">
+          </label>
+        </div>
+        <div class="grid3">
+          <label>Quality (download)
+            <select id="optQuality">
+              <option value="720">720p</option>
+              <option value="1080" selected>1080p</option>
+              <option value="1440">1440p</option>
+              <option value="2160">2160p (4K)</option>
+            </select>
+          </label>
+          <label>Aspect
+            <select id="optAspect">
+              <option value="vertical" selected>9:16 vertical</option>
+              <option value="square">1:1 square</option>
+              <option value="portrait">4:5 portrait</option>
+              <option value="landscape">16:9 wide</option>
+            </select>
+          </label>
+          <label>Language
+            <select id="optLanguage">
+              <option value="" selected>Auto</option>
+              <option value="en">English</option>
+              <option value="hi">Hindi</option>
+              <option value="hinglish">Hinglish (roman)</option>
+            </select>
+          </label>
+        </div>
+        <div class="toggles">
+          <label class="toggle"><input type="checkbox" id="optCaptions" checked> Captions</label>
+          <label class="toggle"><input type="checkbox" id="optHook" checked> Hook headline</label>
+          <label class="toggle"><input type="checkbox" id="optLlm" checked> Use AI (LLM)</label>
+          <label class="toggle"><input type="checkbox" id="optHinglish"> Hinglish captions</label>
+          <label class="toggle"><input type="checkbox" id="optGameEvents" checked> Watch the game (WASTED / explosions / crashes)</label>
+        </div>
+        <div class="grid3">
+          <label>Focus brief (optional)
+            <input id="optFocus" type="text" placeholder="e.g. only clutch rounds &amp; funny fails">
+          </label>
+          <label>AI picking
+            <select id="optBrainMode">
+              <option value="auto" selected>Auto (signals + AI if set up)</option>
+              <option value="llm">Always use AI (LLM)</option>
+              <option value="manual">Manual — my own AI picks (prompts)</option>
+            </select>
+          </label>
+          <label>Minimum viral score
+            <span class="slider-inline"><input type="range" id="optMinScore" min="0" max="90" step="5" value="0"><span id="minScoreVal">0 (keep all)</span></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Extras</h3>
+        <div class="grid3">
+          <label>Style preset
+            <select id="optPreset"><option value="">None</option></select>
+          </label>
+          <label>Wanted stars
+            <select id="optStars">
+              <option value="">Off</option>
+              <option value="auto">Auto (from score)</option>
+              <option value="1">★</option><option value="2">★★</option>
+              <option value="3">★★★</option><option value="4">★★★★</option>
+              <option value="5">★★★★★</option>
+            </select>
+          </label>
+          <label>Campaign banner (paid clipping)
+            <span class="row tight">
+              <input id="optCampaignHandle" type="text" placeholder="@streamer">
+              <input id="optCampaignTag" type="text" value="#ad" size="5">
+            </span>
+          </label>
+        </div>
+        <div class="toggles">
+          <label class="toggle"><input type="checkbox" id="optTitleBar"> Title bar (emoji headline)</label>
+          <label class="toggle"><input type="checkbox" id="optKillcam"> Kill-cam replay (slow-mo peak)</label>
+          <label class="toggle"><input type="checkbox" id="optMissionCard"> Mission card</label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Layout</h3>
+        <div class="layout-grid" id="layoutGrid"></div>
+        <div id="presetRow" hidden>
+          <label class="field-label">Facecam position (preset — fine-tune later on the preview frame)</label>
+          <div class="row">
+            <button class="btn sm" data-preset="tl">Top-left</button>
+            <button class="btn sm" data-preset="tr">Top-right</button>
+            <button class="btn sm" data-preset="bl">Bottom-left</button>
+            <button class="btn sm" data-preset="br">Bottom-right</button>
+            <button class="btn sm" data-preset="none">None (auto)</button>
+            <span class="hint" id="presetHint"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Caption style</h3>
+        <div class="chip-row" id="styleChips"></div>
+        <label class="anim-label">Animation
+          <select id="optAnim"></select>
+        </label>
+      </div>
+
+      <button class="btn primary lg" id="makeBtn">⚡ Make clips</button>
+    </section>
+
+    <!-- ============ JOB VIEW ============ -->
+    <section class="view" id="view-job" hidden>
+      <div class="card" id="jobHead">
+        <div class="row between">
+          <div>
+            <h2 id="jobTitle">Job</h2>
+            <div class="hint" id="jobMeta"></div>
+          </div>
+          <div class="row">
+            <a class="btn sm" id="postingBtn" href="#" target="_blank" rel="noopener">📋 POSTING.md</a>
+            <a class="btn sm" id="exportBtn" href="#" download>⬇ Export all (.zip)</a>
+            <button class="btn sm danger" id="deleteJobBtn">Delete job</button>
+          </div>
+        </div>
+        <div class="progress"><div class="progress-fill" id="jobProgress"></div></div>
+        <div class="row between">
+          <span class="badge" id="jobStatus">queued</span>
+          <span class="hint" id="jobStage"></span>
+        </div>
+        <div class="error-banner" id="jobError" hidden></div>
+        <ul class="notes" id="jobNotes"></ul>
+        <div class="hint" id="jobGameEvents" hidden></div>
+      </div>
+
+      <div class="card" id="aiPanel" hidden>
+        <h3>🤖 Your AI picks the moments</h3>
+        <div class="hint">Copy a prompt into any AI (ChatGPT, Claude, Gemini…), then paste its JSON answer below and submit. The prompt includes the transcript plus volume/chat/game-event marks.</div>
+        <div class="row wrap" id="promptBtns"></div>
+        <textarea id="aiAnswers" rows="6" placeholder='Paste the AI answer here — a JSON list like [{"start": 125, "end": 160, "title": "…", "hook": "…", "score": 85}]'></textarea>
+        <div class="row">
+          <button class="btn primary" id="aiSubmitBtn">Use these picks → make clips</button>
+        </div>
+      </div>
+
+      <div class="card" id="regionCard" hidden>
+        <h3>Regions — drag the boxes on the frame</h3>
+        <div class="region-wrap" id="regionWrap">
+          <img id="frameImg" alt="preview frame">
+          <div class="region-box facecam" id="boxFacecam" hidden>
+            <span class="region-tag">Facecam</span><i class="handle"></i>
+          </div>
+          <div class="region-box game" id="boxGame" hidden>
+            <span class="region-tag">Gameplay</span><i class="handle"></i>
+          </div>
+        </div>
+        <div class="row wrap">
+          <button class="btn sm" data-rpreset="tl">Facecam TL</button>
+          <button class="btn sm" data-rpreset="tr">TR</button>
+          <button class="btn sm" data-rpreset="bl">BL</button>
+          <button class="btn sm" data-rpreset="br">BR</button>
+          <button class="btn sm" data-rpreset="none">None</button>
+          <button class="btn sm" id="detectBtn">Auto-detect facecam</button>
+          <label class="slider-label">Face size
+            <input type="range" id="topSlider" min="0.2" max="0.5" step="0.01" value="0.32">
+            <span id="topVal">0.32</span>
+          </label>
+          <button class="btn primary sm" id="rerenderAllBtn">Re-render all clips</button>
+        </div>
+        <div class="hint">Regions apply when you re-render. Facecam = cyan, Gameplay = lime.</div>
+      </div>
+
+      <div class="clip-grid" id="clipGrid"></div>
+    </section>
+
+    <!-- ============ LIBRARY ============ -->
+    <section class="view" id="view-library" hidden>
+      <div class="library-list" id="libraryList"></div>
+      <div class="hint" id="libraryEmpty" hidden>No jobs yet — make your first clips from New Job.</div>
+    </section>
+
+    <!-- ============ LIVE ============ -->
+    <section class="view" id="view-live" hidden>
+      <div class="card">
+        <label class="field-label" for="liveUrl">Live stream link (Twitch / YouTube Live / Kick)</label>
+        <input id="liveUrl" type="url" placeholder="https://www.twitch.tv/channel" autocomplete="off">
+        <div class="grid3">
+          <label>Layout <select id="liveLayout"></select></label>
+          <label>Caption style <select id="liveStyle"></select></label>
+          <label>Auto-check every (min)
+            <input id="liveEvery" type="number" min="1" max="30" step="1" value="3">
+          </label>
+        </div>
+        <div class="row">
+          <button class="btn primary" id="liveStartBtn">● Start live clipping</button>
+          <button class="btn danger" id="liveStopBtn" disabled>Stop</button>
+          <button class="btn" id="clipNowBtn" disabled>Clip last 30s</button>
+        </div>
+      </div>
+      <div class="card" id="liveStatusCard" hidden>
+        <div class="row between">
+          <span class="badge" id="liveStatus">starting</span>
+          <span class="hint" id="liveElapsed">0:00</span>
+        </div>
+        <label class="field-label">Hype</label>
+        <div class="hype"><div class="hype-fill" id="hypeFill"></div></div>
+        <div class="hint" id="liveTitle"></div>
+        <div class="error-banner" id="liveError" hidden></div>
+      </div>
+      <div class="clip-grid" id="liveClipGrid"></div>
+    </section>
+
+    <!-- ============ SETTINGS ============ -->
+    <section class="view" id="view-settings" hidden>
+      <div class="card">
+        <h3>AI (LLM) — optional, for smarter clip picks &amp; titles</h3>
+        <label class="field-label" for="llmBase">Base URL (OpenAI-compatible)</label>
+        <input id="llmBase" type="url" placeholder="http://127.0.0.1:11434/v1">
+        <label class="field-label" for="llmModel">Model</label>
+        <input id="llmModel" type="text" placeholder="llama3.2:3b">
+        <label class="field-label" for="llmKey">API key</label>
+        <input id="llmKey" type="password" placeholder="API key" autocomplete="off">
+        <div class="hint">Leave the key empty to keep the saved one. The key is stored on this machine only and never shown again.</div>
+        <button class="btn primary" id="saveSettingsBtn">Save settings</button>
+      </div>
+      <div class="card">
+        <h3>Watchlist — creators to check when finding streams</h3>
+        <textarea id="watchlistText" rows="5" placeholder="One per line:&#10;twitch:shroud&#10;youtube:@DuckyReloaded1&#10;kick:dasgasd3m | gta"></textarea>
+        <div class="hint">Format: <code>platform:handle</code>, optionally <code>| topic</code> to only match that topic. Used by “Find streams” on the New Job tab.</div>
+        <button class="btn primary" id="saveWatchlistBtn">Save watchlist</button>
+      </div>
+      <div class="card">
+        <h3>Speech model</h3>
+        <div class="hint">Whisper model in use: <b id="asrModel">—</b></div>
+        <div class="hint">ClipForge is a local tool with no sign-in — anyone who can reach this page on your network can use it. Keep it on your own machine.</div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
