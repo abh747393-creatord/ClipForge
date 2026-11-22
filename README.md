@@ -33,8 +33,22 @@ CLIPFORGE_PORT=8780 .venv/bin/python -m app
 
 Requirements: Python 3.10+, ffmpeg/ffprobe on PATH. Everything else is in
 `requirements.txt`. The Whisper model downloads on first use (~150 MB for
-`base`). No accounts, no API keys required — an LLM is optional (Settings
-tab, any OpenAI-compatible endpoint, e.g. a local Ollama).
+`base`), and the caption fonts + face model download automatically on
+first start (they are not committed to the repo). No accounts, no API keys
+required — an LLM is optional (Settings tab, any OpenAI-compatible
+endpoint, e.g. a local Ollama).
+
+**Windows:** install Python 3.10+ (python.org, tick "Add python.exe to
+PATH") and ffmpeg (`winget install Gyan.FFmpeg`), then in the ClipForge
+folder:
+
+```bat
+py -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -m app
+```
+
+Then open **http://127.0.0.1:8780**
 
 ## How it works
 

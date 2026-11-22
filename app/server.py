@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import captions, config, facecam, jobs, layouts, live, llm, media, presets, publish
+from . import assets, captions, config, facecam, jobs, layouts, live, llm, media, presets, publish
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 VERSION = "1.0.0"
@@ -411,4 +411,6 @@ async def put_settings(payload: dict):
 
 
 def main() -> None:
+    for line in assets.ensure_assets():
+        print(f"[clipforge] {line}")
     uvicorn.run(app, host=config.HOST, port=config.PORT)
