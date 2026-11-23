@@ -263,7 +263,11 @@ def info(url) -> dict:
 def probe(path) -> dict:
     """{"duration","width","height","has_audio","fps"} via ffprobe JSON.
     Raises RuntimeError if ffprobe fails or the file has no video stream."""
-    p = run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)])
+    try:
+        p = run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+                timeout=60)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("ffprobe timed out reading this file.")
     if p.returncode != 0:
         raise RuntimeError(f"ffprobe failed: {(p.stderr or '')[-500:]}")
     data = json.loads(p.stdout)

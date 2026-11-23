@@ -21,6 +21,7 @@ Triggers (checked every 2 s by the monitor thread):
 Auto clips are rate-limited: >= 60 s apart, max live_per_hour per hour.
 Manual "clip now" bypasses the rate limit.
 """
+import json
 import math
 import queue
 import random
@@ -50,6 +51,12 @@ CLIP_RE = re.compile(r"\bclip(\s+(it|that|this))?\b", re.IGNORECASE)
 TWITCH_RE = re.compile(r"twitch\.tv/([A-Za-z0-9_]{3,25})", re.IGNORECASE)
 
 SESSIONS: dict = {}
+PAST_SESSIONS: dict = {}  # session_id -> persisted state dict (ended sessions, loaded at startup)
+
+# One live clip renders at a time, process-wide. Auto-clips used to spawn
+# unbounded threads that each ran ffmpeg + Whisper at once; on a normal PC
+# they saturated the CPU and every clip after the first sat at "rendering".
+_RENDER_SEM = threading.Semaphore(1)
 
 
 def _iso(ts: float) -> str:
@@ -127,6 +134,7 @@ class LiveSession:
                 proc.terminate()
             except OSError:
                 pass
+        self._persist()
 
     def state(self) -> dict:
         with self._lock:
@@ -144,6 +152,17 @@ class LiveSession:
             "rec_height": int(getattr(self, "rec_height", 0) or 0),
         }
 
+    def _persist(self) -> None:
+        """Write session.json so the session (and its clips) survive a page
+        reload and a server restart. Best-effort: never break the session."""
+        try:
+            data = self.state()
+            tmp = self.dir / "session.json.tmp"
+            tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+            tmp.replace(self.dir / "session.json")
+        except Exception:  # noqa: BLE001
+            pass
+
     # ------------------------------------------------------------------ ingest
     def _run(self) -> None:
         try:
@@ -153,10 +172,12 @@ class LiveSession:
             urls = list(resolved.get("urls") or [])
             if not urls:
                 raise RuntimeError("Could not resolve that live stream.")
+            self._persist()
         except Exception as e:  # noqa: BLE001
             self.status = "error"
             self.error = str(e)
             self._stop.set()
+            self._persist()
             return
 
         while not self._stop.is_set():
@@ -190,6 +211,7 @@ class LiveSession:
                 pass
         if self.status == "recording":
             self.status = "stopped"
+        self._persist()
 
     def _start_ffmpeg(self, urls: list):
         self._part += 1
@@ -534,6 +556,8 @@ class LiveSession:
                 "facecam": self.options.get("facecam"), "game": self.options.get("game")}
         with self._lock:
             self.clips.append(clip)
+        self._persist()
+        _sem = False
         try:
             # wait (<= 60 s) until the buffer covers [a, b] — spike/phrase
             # windows reach a few seconds into the future
@@ -551,6 +575,12 @@ class LiveSession:
             if not segs or segs[0][1] > a + 2:
                 raise RuntimeError("That part of the stream is no longer in the buffer.")
             seg0_time = segs[0][1]
+
+            # Serialize the heavy work (concat + Whisper + ffmpeg render):
+            # one live clip at a time, so clips queue instead of piling up
+            # and wedging the machine.
+            _RENDER_SEM.acquire()
+            _sem = True
 
             lst = self.clips_dir / f"{name}.txt"
             lst.write_text("".join(f"file '{s[0].as_posix()}'\n" for s in segs), encoding="utf-8")
@@ -633,6 +663,10 @@ class LiveSession:
         except Exception as e:  # noqa: BLE001 - one failed clip must not stop the session
             clip["status"] = "error"
             clip["error"] = str(e)
+        finally:
+            if _sem:
+                _RENDER_SEM.release()
+            self._persist()
 
 
 def _norm_word(text: str) -> str:
@@ -697,6 +731,7 @@ def start_session(url: str, options: dict | None, store) -> LiveSession:
     session = LiveSession(url, options, store)
     SESSIONS[session.id] = session
     session.start()
+    session._persist()
     return session
 
 
@@ -709,6 +744,222 @@ def stop_session(session_id: str):
     if session:
         session.stop()
     return session
+
+
+def load_past_sessions() -> int:
+    """Startup: reload persisted sessions from disk so past live sessions and
+    their clips stay visible after a restart. A session that was mid-recording
+    when the process died is shown as 'ended'."""
+    root = config.DATA_DIR / "live"
+    if not root.exists():
+        return 0
+    n = 0
+    for p in root.glob("*/session.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        sid = data.get("id")
+        if not sid or sid in SESSIONS or sid in PAST_SESSIONS:
+            continue
+        if data.get("status") in ("starting", "recording"):
+            data["status"] = "ended"
+        PAST_SESSIONS[sid] = data
+        n += 1
+    return n
+
+
+def session_state(session_id: str):
+    """State dict for an active OR past session, or None."""
+    s = SESSIONS.get(session_id)
+    if s:
+        return s.state()
+    return PAST_SESSIONS.get(session_id)
+
+
+def list_sessions() -> list:
+    """Active sessions first, then past ones (newest first)."""
+    active = [s.state() for s in SESSIONS.values()]
+    past = sorted(PAST_SESSIONS.values(), key=lambda d: d.get("started_at") or "", reverse=True)
+    return active + past
+
+
+# ------------------------------------------------------------------ creators (PeakCut-style)
+# Saved creators live in data/creators.json and survive restarts. The watcher
+# checks each one; the moment a creator is live, a real-time recording
+# session starts automatically (same pipeline as the Live tab).
+CREATORS_FILE = config.DATA_DIR / "creators.json"
+_CREATORS_LOCK = threading.Lock()
+CREATORS: list = []
+
+
+def _creators_save() -> None:
+    try:
+        CREATORS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CREATORS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(CREATORS, indent=1, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(CREATORS_FILE)
+    except OSError as e:
+        print(f"[clipforge] warning: could not save creators: {e}", flush=True)
+
+
+def _creator_url(platform: str, handle: str):
+    """(platform, display_handle, live_url) from a handle or a pasted URL."""
+    raw = (handle or "").strip()
+    if not raw:
+        raise ValueError("type a creator handle or channel link first")
+    low = raw.lower()
+    if "twitch.tv" in low:
+        platform = "twitch"
+        m = re.search(r"twitch\.tv/([A-Za-z0-9_]{3,25})", raw)
+        h = m.group(1) if m else raw.strip("/").split("/")[-1]
+        return platform, h, f"https://www.twitch.tv/{h}"
+    if "kick.com" in low:
+        platform = "kick"
+        m = re.search(r"kick\.com/([A-Za-z0-9_-]+)", raw)
+        h = m.group(1) if m else raw.strip("/").split("/")[-1]
+        return platform, h, f"https://kick.com/{h}"
+    if "youtube.com" in low or "youtu.be" in low or platform == "youtube":
+        m = re.search(r"youtube\.com/@([A-Za-z0-9_.-]+)", raw)
+        if m:
+            h = "@" + m.group(1)
+            return "youtube", h, f"https://www.youtube.com/{h}/live"
+        m = re.search(r"youtube\.com/channel/(UC[A-Za-z0-9_-]+)", raw)
+        if m:
+            h = m.group(1)
+            return "youtube", h, f"https://www.youtube.com/channel/{h}/live"
+        h = raw.strip("/").split("/")[-1]
+        if h.startswith("UC") and len(h) >= 20:
+            return "youtube", h, f"https://www.youtube.com/channel/{h}/live"
+        if not h.startswith("@"):
+            h = "@" + h
+        return "youtube", h, f"https://www.youtube.com/{h}/live"
+    # bare handle, platform given (or default twitch-style slug)
+    h = raw.strip("/").split("/")[-1]
+    if platform == "kick":
+        return "kick", h, f"https://kick.com/{h}"
+    if platform == "youtube":
+        if h.startswith("UC") and len(h) >= 20:
+            return "youtube", h, f"https://www.youtube.com/channel/{h}/live"
+        if not h.startswith("@"):
+            h = "@" + h
+        return "youtube", h, f"https://www.youtube.com/{h}/live"
+    return "twitch", h, f"https://www.twitch.tv/{h}"
+
+
+def init_creators() -> int:
+    """Load creators.json; on first run, import the old watchlist.txt so
+    nobody's saved channels are lost. Returns how many creators are loaded."""
+    global CREATORS
+    with _CREATORS_LOCK:
+        if CREATORS_FILE.exists():
+            try:
+                data = json.loads(CREATORS_FILE.read_text(encoding="utf-8"))
+                CREATORS = data if isinstance(data, list) else []
+                return len(CREATORS)
+            except (OSError, ValueError):
+                CREATORS = []
+                return 0
+        CREATORS = []
+        # one-time import of the legacy watchlist.txt ("platform:handle" lines)
+        p = config.DATA_DIR / "watchlist.txt"
+        if p.exists():
+            for raw in p.read_text(encoding="utf-8").splitlines():
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                who = line.partition("|")[0].strip()
+                platform, _, handle = who.partition(":")
+                handle = handle.strip()
+                if not handle:
+                    continue
+                try:
+                    plat, disp, url = _creator_url(platform.strip().lower() or "twitch", handle)
+                except ValueError:
+                    continue
+                CREATORS.append(_new_creator(plat, disp, url))
+            if CREATORS:
+                _creators_save()
+        return len(CREATORS)
+
+
+def _new_creator(platform: str, handle: str, url: str, name: str = "") -> dict:
+    return {
+        "id": uuid.uuid4().hex[:10],
+        "platform": platform,
+        "handle": handle,
+        "name": (name or handle).strip()[:60],
+        "url": url,
+        "auto_record": True,
+        "is_live": False,
+        "session_id": None,
+        "last_checked": None,
+        "added": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def creators_list() -> list:
+    with _CREATORS_LOCK:
+        return [dict(c) for c in CREATORS]
+
+
+def creator_add(platform: str, handle: str, name: str = "") -> dict:
+    plat, disp, url = _creator_url((platform or "").strip().lower(), handle)
+    with _CREATORS_LOCK:
+        for c in CREATORS:
+            if c.get("url") == url:
+                return dict(c)  # already saved
+        c = _new_creator(plat, disp, url, name)
+        CREATORS.append(c)
+        _creators_save()
+        return dict(c)
+
+
+def creator_remove(creator_id: str) -> bool:
+    with _CREATORS_LOCK:
+        before = len(CREATORS)
+        CREATORS[:] = [c for c in CREATORS if c.get("id") != creator_id]
+        if len(CREATORS) != before:
+            _creators_save()
+            return True
+        return False
+
+
+def _active_session_for(url: str):
+    for s in SESSIONS.values():
+        if s.url == url and s.status in ("starting", "recording"):
+            return s
+    return None
+
+
+def creator_check(creator: dict, store) -> dict:
+    """Check one creator right now. If live and not already recording, start
+    the live recording session immediately (real-time, like PeakCut)."""
+    url = creator.get("url") or ""
+    live_now = _is_live(url) if url else False
+    session = _active_session_for(url)
+    if live_now and session is None and creator.get("auto_record", True):
+        session = start_session(url, {}, store)
+        print(f"[clipforge] creator {creator.get('handle')} is LIVE — recording started ({session.id})", flush=True)
+    with _CREATORS_LOCK:
+        for c in CREATORS:
+            if c.get("id") == creator.get("id"):
+                c["is_live"] = bool(live_now)
+                c["session_id"] = session.id if session else None
+                c["last_checked"] = datetime.now(timezone.utc).isoformat()
+                _creators_save()
+                return dict(c)
+    return dict(creator, is_live=bool(live_now), session_id=session.id if session else None)
+
+
+def _watch_creators(store) -> None:
+    for c in creators_list():
+        if not c.get("auto_record", True):
+            continue
+        try:
+            creator_check(c, store)
+        except Exception:  # noqa: BLE001 - one bad check must not stop the watcher
+            pass
 
 
 # ------------------------------------------------------------------ auto-record watch
@@ -756,12 +1007,13 @@ def _auto_record_on() -> bool:
         return False
 
 
-def watch_loop(store, interval: int = 120) -> None:
-    """PeakCut/NeonClipping creator watcher: every `interval` seconds, when
-    auto_record is on in Settings, check watchlist channels and start a live
-    session for any that just went live (one session per URL)."""
+def watch_loop(store, interval: int = 60) -> None:
+    """Creator watcher: every `interval` seconds, check saved creators and
+    start a live recording the moment one goes live. The legacy watchlist.txt
+    channels are also checked when auto_record is on in Settings."""
     while True:
         try:
+            _watch_creators(store)
             if _auto_record_on():
                 active = {s.url for s in SESSIONS.values()
                           if s.status in ("starting", "recording")}

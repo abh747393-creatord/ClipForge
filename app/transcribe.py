@@ -13,6 +13,11 @@ from . import config, media, roman
 
 _MODELS = {}
 _LOCK = threading.Lock()
+# One transcription at a time, process-wide. faster-whisper/ctranslate2 is not
+# safe under concurrent transcribe() calls on the same model — the live ASR
+# worker, live clip alignment and job workers used to race each other, which
+# wedged clip renders at "rendering" forever on Windows. Serialize instead.
+_TRANSCRIBE_LOCK = threading.Lock()
 
 # Roman/Devanagari steering prompts (NeonClipping captions.py).
 ROMAN_PROMPT = "Aaj hum GTA 6 ke baare mein baat karenge, yeh bahut mast hai. Kya haal hai bhai, chalo shuru karte hain. Matlab ekdum sahi hai, nahi yaar, bilkul."
@@ -102,15 +107,19 @@ def transcribe_wav(wav_path, language=None, model=None):
     audio, _sr = media.load_wav_mono(wav_path)
     whisper_lang = "hi" if language == "hinglish" else (language or None)
     prompt = DEVA_PROMPT if language in ("hi", "hinglish") else None
-    segments, info = m.transcribe(audio, beam_size=5, language=whisper_lang,
-                                  initial_prompt=prompt, word_timestamps=True,
-                                  vad_filter=True, condition_on_previous_text=False)
-    words = []
-    for segment in segments:
-        for w in segment.words or []:
-            text = (w.word or "").strip()
-            if text and w.end > w.start:
-                words.append({"start": round(max(0.0, w.start), 3), "end": round(w.end, 3), "text": text})
+    # The lock covers the generator iteration too: m.transcribe() does its
+    # real work lazily as segments are consumed. Concurrent calls on one
+    # ctranslate2 model can deadlock — never let two run at once.
+    with _TRANSCRIBE_LOCK:
+        segments, info = m.transcribe(audio, beam_size=5, language=whisper_lang,
+                                      initial_prompt=prompt, word_timestamps=True,
+                                      vad_filter=True, condition_on_previous_text=False)
+        words = []
+        for segment in segments:
+            for w in segment.words or []:
+                text = (w.word or "").strip()
+                if text and w.end > w.start:
+                    words.append({"start": round(max(0.0, w.start), 3), "end": round(w.end, 3), "text": text})
     words = _collapse_repeats(words)
     if language == "hinglish":
         words = roman.words(words)

@@ -547,6 +547,21 @@
     <!-- ============ LIVE ============ -->
     <section class="view" id="view-live" hidden>
       <div class="card">
+        <label class="field-label">Creators — auto-record when they go live</label>
+        <div class="hint">Add a creator once. ClipForge keeps checking, and the moment they go live the recording starts by itself (like PeakCut). Saved creators stay saved after restart.</div>
+        <div class="row wrap">
+          <select id="creatorPlatform">
+            <option value="youtube">YouTube</option>
+            <option value="twitch">Twitch</option>
+            <option value="kick">Kick</option>
+          </select>
+          <input id="creatorHandle" type="text" placeholder="@handle or channel link" autocomplete="off" style="flex:1;min-width:180px">
+          <button class="btn primary" id="creatorAddBtn" type="button">＋ Add creator</button>
+        </div>
+        <div id="creatorList"></div>
+        <div class="hint" id="creatorEmpty">No creators yet — add one above.</div>
+      </div>
+      <div class="card">
         <label class="field-label" for="liveUrl">Live stream link (Twitch / YouTube Live / Kick)</label>
         <div class="row">
           <input id="liveUrl" type="url" placeholder="https://www.twitch.tv/channel" autocomplete="off" style="flex:1">
@@ -614,6 +629,10 @@
         <div class="error-banner" id="liveError" hidden></div>
       </div>
       <div class="clip-grid" id="liveClipGrid"></div>
+      <div class="card" id="pastLiveCard" hidden>
+        <label class="field-label">Past live sessions</label>
+        <div id="pastLiveList"></div>
+      </div>
     </section>
 
     <!-- ============ SETTINGS ============ -->

@@ -19,13 +19,15 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import assets, brain, captions, config, facecam, jobs, layouts, live, llm, media, presets, preview, publish
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 UPLOAD_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 STATIC_FILES = {"style.css", "app.js"}
 
 config.ensure_dirs()
 store = jobs.JobStore()
 store.load_existing()
+live.load_past_sessions()   # past live sessions + clips survive restarts
+live.init_creators()        # saved creators (imports legacy watchlist.txt once)
 live.start_watcher(store)
 
 # Last resolved preview metadata per URL (lets /api/preview-frame reuse
@@ -693,6 +695,12 @@ async def llm_test(payload: dict):
 
 
 # ---------------------------------------------------------------------- live
+@app.get("/api/live")
+async def live_list():
+    """All live sessions — active ones first, then past (persisted) ones."""
+    return live.list_sessions()
+
+
 @app.post("/api/live/start")
 async def live_start(payload: dict):
     url = (payload.get("url") or "").strip()
@@ -704,10 +712,10 @@ async def live_start(payload: dict):
 
 @app.get("/api/live/{session_id}")
 async def live_state(session_id: str):
-    session = live.get_session(session_id)
-    if session is None:
+    state = live.session_state(session_id)
+    if state is None:
         raise HTTPException(404, "live session not found")
-    return session.state()
+    return state
 
 
 @app.post("/api/live/{session_id}/clip-now")
@@ -728,6 +736,37 @@ async def live_stop(session_id: str):
     if session is None:
         raise HTTPException(404, "live session not found")
     return session.state()
+
+
+# ---------------------------------------------------------------------- creators
+@app.get("/api/creators")
+async def creators_list():
+    return live.creators_list()
+
+
+@app.post("/api/creators")
+async def creators_add(payload: dict):
+    try:
+        return live.creator_add(payload.get("platform") or "", payload.get("handle") or "",
+                                payload.get("name") or "")
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.delete("/api/creators/{creator_id}")
+async def creators_remove(creator_id: str):
+    if not live.creator_remove(creator_id):
+        raise HTTPException(404, "creator not found")
+    return {"ok": True}
+
+
+@app.post("/api/creators/{creator_id}/check")
+async def creators_check(creator_id: str):
+    """Check one creator now; starts the live recording if they are live."""
+    for c in live.creators_list():
+        if c.get("id") == creator_id:
+            return live.creator_check(c, store)
+    raise HTTPException(404, "creator not found")
 
 
 # ---------------------------------------------------------------------- settings

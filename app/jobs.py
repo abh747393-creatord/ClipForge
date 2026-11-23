@@ -22,6 +22,7 @@ import copy
 import json
 import shutil
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -334,10 +335,12 @@ class JobStore:
         try:
             d.mkdir(parents=True, exist_ok=True)
             with self._lock:
-                tmp.write_text(json.dumps(job, indent=1, ensure_ascii=False), encoding="utf-8")
+                # default=str: a stray non-JSON value in a clip dict must never
+                # raise here and kill the render loop mid-job.
+                tmp.write_text(json.dumps(job, indent=1, ensure_ascii=False, default=str), encoding="utf-8")
                 tmp.replace(d / "job.json")
             return True
-        except OSError as e:
+        except (OSError, TypeError, ValueError) as e:
             print(f"[clipforge] warning: could not save job {job.get('id')}: {e}", flush=True)
             try:
                 tmp.unlink(missing_ok=True)
@@ -811,6 +814,12 @@ def run_job(job: dict, store: JobStore) -> None:
             _set(job, store, progress=0.7 + 0.3 * (i / n))
             name = f"clip{i + 1:02d}"
             clip["name"] = name
+            # Truthful per-clip state: the UI shows exactly which clip is
+            # encoding right now instead of every pending clip at once.
+            clip["status"] = "rendering"
+            store.save(job)
+            _t0 = time.time()
+            print(f"[clipforge] job {job['id']} rendering clip {i + 1}/{len(clips)}", flush=True)
             offset = float(clip.get("src_offset") or 0.0)
             clip_src = Path(clip["src"])
             sec_dur = float(clip.pop("_sec_dur", 0) or 0)
@@ -843,9 +852,11 @@ def run_job(job: dict, store: JobStore) -> None:
                 clip.update(_basename_fields(result))
                 clip["status"] = "done"
                 clip["error"] = None
+                print(f"[clipforge] job {job['id']} clip {i + 1}/{len(clips)} done in {time.time() - _t0:.0f}s", flush=True)
             except Exception as e:  # noqa: BLE001 - one bad clip must not kill the job
                 clip["status"] = "error"
                 clip["error"] = str(e)
+                print(f"[clipforge] job {job['id']} clip {i + 1}/{len(clips)} FAILED after {time.time() - _t0:.0f}s: {e}", flush=True)
             store.save(job)
 
         try:

@@ -190,6 +190,7 @@ function showView(name) {
   if (name !== "job") stopJobPolling();
   if (name === "library") loadLibrary().catch((e) => toast(e.message));
   if (name === "settings") loadSettings().catch((e) => toast(e.message));
+  if (name === "live") { loadCreators().catch(() => {}); restoreLive().catch(() => {}); }
 }
 
 /* ---------------- status ---------------- */
@@ -560,6 +561,7 @@ async function makeClips() {
 /* ---------------- job view ---------------- */
 function openJob(id) {
   state.currentJobId = id;
+  try { localStorage.setItem("cf_jobId", id); } catch (e) { /* private mode */ }
   showView("job");
   refreshJob().catch((e) => toast(e.message));
   startJobPolling();
@@ -1087,21 +1089,31 @@ async function loadLibrary() {
 }
 
 /* ---------------- live ---------------- */
+function attachLive(s) {
+  // Show a session (just started, auto-started by the creator watcher, or
+  // restored after a reload) and keep it updated.
+  state.liveId = s.id;
+  state.liveSig = null;
+  try { localStorage.setItem("cf_liveId", s.id); } catch (e) { /* private mode */ }
+  $("liveStatusCard").hidden = false;
+  const active = ["starting", "recording"].includes(s.status);
+  $("liveStopBtn").disabled = !active;
+  $("clipNowBtn").disabled = !active;
+  $("liveStartBtn").disabled = active;
+  renderLive(s);
+  stopLivePolling();
+  if (active) {
+    state.liveTimer = setInterval(() => {
+      api("/api/live/" + state.liveId).then(renderLive).catch(() => { /* keep polling */ });
+    }, 2000);
+  }
+}
 async function startLive() {
   const url = $("liveUrl").value.trim();
   if (!url) { toast("Paste a live stream link first."); return; }
   try {
     const s = await postJSON("/api/live/start", { url: url, options: liveOptions() });
-    state.liveId = s.id;
-    $("liveStatusCard").hidden = false;
-    $("liveStopBtn").disabled = false;
-    $("clipNowBtn").disabled = false;
-    $("liveStartBtn").disabled = true;
-    renderLive(s);
-    stopLivePolling();
-    state.liveTimer = setInterval(() => {
-      api("/api/live/" + state.liveId).then(renderLive).catch(() => { /* keep polling */ });
-    }, 2000);
+    attachLive(s);
   } catch (e) { toast(e.message); }
 }
 function stopLivePolling() {
@@ -1117,7 +1129,7 @@ function renderLive(s) {
   const err = $("liveError");
   err.hidden = !s.error;
   err.textContent = s.error || "";
-  if (s.status === "stopped" || s.status === "error") {
+  if (["stopped", "error", "ended"].includes(s.status)) {
     stopLivePolling();
     $("liveStopBtn").disabled = true;
     $("clipNowBtn").disabled = true;
@@ -1160,6 +1172,97 @@ function renderLive(s) {
     const t = playing[v.getAttribute("src")];
     if (t != null) { v.currentTime = t; v.play().catch(() => {}); }
   });
+}
+
+/* ---------------- creators (auto-record) ---------------- */
+async function loadCreators() {
+  const creators = await api("/api/creators");
+  const list = $("creatorList");
+  list.innerHTML = "";
+  $("creatorEmpty").hidden = creators.length > 0;
+  for (const c of creators) {
+    const row = document.createElement("div");
+    row.className = "lib-row";
+    const live = c.is_live && c.session_id;
+    const status = live ? "🔴 LIVE — recording" : (c.is_live ? "🔴 LIVE" : "⚪ offline");
+    row.innerHTML = '<div class="lib-main"><div class="lib-title">' + esc(c.name || c.handle) + '</div>' +
+      '<div class="lib-sub">' + esc(c.platform) + " · " + esc(c.handle) + " · " + status +
+      (c.last_checked ? " · checked " + esc(fmtDate(c.last_checked)) : "") + "</div></div>" +
+      (live ? '<button class="btn sm cr-watch">Watch</button>' : '<button class="btn sm cr-check">Check now</button>') +
+      '<button class="btn sm danger cr-del">Remove</button>';
+    const watch = row.querySelector(".cr-watch");
+    if (watch) watch.addEventListener("click", async () => {
+      try { attachLive(await api("/api/live/" + c.session_id)); }
+      catch (e) { toast(e.message); }
+    });
+    const check = row.querySelector(".cr-check");
+    if (check) check.addEventListener("click", async () => {
+      check.disabled = true; check.textContent = "checking…";
+      try {
+        const r = await postJSON("/api/creators/" + c.id + "/check", {});
+        if (r.is_live && r.session_id) { attachLive(await api("/api/live/" + r.session_id)); toast("They are live — recording started.", true); }
+        else toast("Not live right now.");
+      } catch (e) { toast(e.message); }
+      loadCreators().catch(() => {});
+    });
+    row.querySelector(".cr-del").addEventListener("click", async () => {
+      if (!confirm("Remove " + (c.name || c.handle) + " from creators?")) return;
+      try { await api("/api/creators/" + c.id, { method: "DELETE" }); loadCreators(); }
+      catch (e) { toast(e.message); }
+    });
+    list.appendChild(row);
+  }
+}
+async function addCreator() {
+  const handle = $("creatorHandle").value.trim();
+  if (!handle) { toast("Type a creator handle or channel link first."); return; }
+  try {
+    const c = await postJSON("/api/creators", { platform: $("creatorPlatform").value, handle: handle });
+    $("creatorHandle").value = "";
+    toast("Creator saved: " + (c.name || c.handle), true);
+    loadCreators().catch(() => {});
+    // check right away so a live creator starts recording immediately
+    const r = await postJSON("/api/creators/" + c.id + "/check", {}).catch(() => null);
+    if (r && r.is_live && r.session_id) { attachLive(await api("/api/live/" + r.session_id)); toast("They are live — recording started.", true); }
+    loadCreators().catch(() => {});
+  } catch (e) { toast(e.message); }
+}
+
+/* ---------------- restore after reload ---------------- */
+async function restoreLive() {
+  const sessions = await api("/api/live");
+  const active = sessions.find((s) => ["starting", "recording"].includes(s.status));
+  if (active) {
+    if (state.liveId !== active.id || !state.liveTimer) attachLive(active);
+  } else if (!state.liveId) {
+    let stored = "";
+    try { stored = localStorage.getItem("cf_liveId") || ""; } catch (e) { /* private mode */ }
+    const past = sessions.find((s) => s.id === stored);
+    if (past) attachLive(past);
+  }
+  renderPastLive(sessions.filter((s) => !["starting", "recording"].includes(s.status)));
+}
+function renderPastLive(past) {
+  const card = $("pastLiveCard");
+  const list = $("pastLiveList");
+  card.hidden = past.length === 0;
+  list.innerHTML = "";
+  for (const s of past.slice(0, 10)) {
+    const row = document.createElement("div");
+    row.className = "lib-row";
+    row.innerHTML = '<div class="lib-main"><div class="lib-title">' + esc(s.title || s.url || s.id) + '</div>' +
+      '<div class="lib-sub">' + esc(fmtDate(s.started_at)) + " · " + (s.clips || []).length + " clips</div></div>" +
+      '<span class="badge ' + esc(s.status) + '">' + esc(s.status) + "</span>";
+    row.addEventListener("click", () => attachLive(s));
+    list.appendChild(row);
+  }
+}
+async function restoreSession() {
+  // Wherever you left off, it resumes from there: live session + open job.
+  await restoreLive().catch(() => {});
+  let jobId = "";
+  try { jobId = localStorage.getItem("cf_jobId") || ""; } catch (e) { /* private mode */ }
+  if (jobId) openJob(jobId);
 }
 
 /* ---------------- discover ---------------- */
@@ -1347,6 +1450,8 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   $("liveStartBtn").addEventListener("click", startLive);
+  $("creatorAddBtn").addEventListener("click", addCreator);
+  $("creatorHandle").addEventListener("keydown", (e) => { if (e.key === "Enter") addCreator(); });
   $("liveStopBtn").addEventListener("click", async () => {
     if (!state.liveId) return;
     try { renderLive(await postJSON("/api/live/" + state.liveId + "/stop", {})); }
@@ -1622,4 +1727,7 @@ document.addEventListener("DOMContentLoaded", () => {
   loadStatus().catch(() => {});
   loadCatalogs().catch((e) => toast("Could not load layouts/styles: " + e.message));
   loadProfiles().catch(() => {});
+  restoreSession().catch(() => {});
+  // Keep creator live-status fresh while the app is open.
+  setInterval(() => { if (!$("view-live").hidden) loadCreators().catch(() => {}); }, 20000);
 });
