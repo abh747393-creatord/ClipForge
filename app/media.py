@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import wave
 from pathlib import Path
 from urllib.parse import urlparse
@@ -93,19 +94,33 @@ def _proxy_url():
     return url or None
 
 
-def _cookie_browser():
-    """yt-dlp cookiesfrombrowser tuple for a signed-in local browser, or None.
+def _cookie_browsers():
+    """yt-dlp cookiesfrombrowser tuples for signed-in local browsers.
 
     Env CLIPFORGE_COOKIES_BROWSER overrides ("chromium", "chrome", "firefox",
-    "none" to disable). Otherwise auto-detects Chromium/Chrome profiles
-    (incl. the snap Chromium profile). Used as a last ladder rung — it
-    unlocks age-restricted videos on a home connection. Never combined with
-    the proxy (proven to break format listing)."""
+    "edge", "none" to disable). Otherwise auto-detects: on Windows, Firefox /
+    Chrome / Edge installs (yt-dlp resolves the default profile itself, so
+    no profile path is passed); on Linux, Chromium/Chrome profiles (incl.
+    the snap Chromium profile). Used as late ladder rungs — they unlock
+    age-restricted videos and help with bot checks on a home connection.
+    Never combined with the proxy (proven to break format listing)."""
     override = (os.environ.get("CLIPFORGE_COOKIES_BROWSER") or "").strip().lower()
     if override == "none":
-        return None
+        return []
     if override:
-        return (override,)
+        return [(override,)]
+    if sys.platform == "win32":
+        found = []
+        appdata = Path(os.environ.get("APPDATA") or Path.home() / "AppData/Roaming")
+        local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")
+        # Firefox first: its cookie store reads reliably on Windows.
+        if (appdata / "Mozilla/Firefox/Profiles").is_dir():
+            found.append(("firefox",))
+        if (local / "Google/Chrome/User Data/Default/Network/Cookies").is_file():
+            found.append(("chrome",))
+        if (local / "Microsoft/Edge/User Data/Default/Network/Cookies").is_file():
+            found.append(("edge",))
+        return found
     home = Path.home()
     candidates = [
         ("chromium", home / "snap/chromium/common/chromium/Default"),
@@ -116,23 +131,80 @@ def _cookie_browser():
     ]
     for name, profile in candidates:
         if (profile / "Cookies").is_file() or (profile / "Network/Cookies").is_file():
-            return (name, str(profile))
-    return None
+            return [(name, str(profile))]
+    return []
+
+
+_POT_CACHE = {}
+
+
+def _po_token():
+    """(po_token, visitor_data) for YouTube's bot check, or (None, None).
+
+    Sources, first hit wins: env CLIPFORGE_PO_TOKEN (+ CLIPFORGE_VISITOR_DATA),
+    then a token file — env CLIPFORGE_POT_FILE, else <data dir>/pot.txt in
+    the `po_token=` / `visitor_data=` line format written by
+    tools/mint-pot.mjs (Mint-PO-Token.bat on Windows). Cached by file mtime
+    so a re-minted token is picked up without a restart. Tokens live ~12h;
+    an expired one just fails its ladder rung and the next route runs."""
+    env_tok = (os.environ.get("CLIPFORGE_PO_TOKEN") or "").strip()
+    if env_tok:
+        return env_tok, (os.environ.get("CLIPFORGE_VISITOR_DATA") or "").strip() or None
+    pot_file = (os.environ.get("CLIPFORGE_POT_FILE") or "").strip()
+    if pot_file:
+        path = Path(pot_file)
+    else:
+        data_dir = os.environ.get("CLIPFORGE_DATA_DIR")
+        base = Path(data_dir) if data_dir else Path(__file__).resolve().parent.parent / "data"
+        path = base / "pot.txt"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None, None
+    key = str(path)
+    if _POT_CACHE.get(key, (None,))[0] == mtime:
+        return _POT_CACHE[key][1], _POT_CACHE[key][2]
+    tok = vd = None
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("po_token="):
+                tok = line.split("=", 1)[1].strip() or None
+            elif line.startswith("visitor_data="):
+                vd = line.split("=", 1)[1].strip() or None
+    except OSError:
+        return None, None
+    _POT_CACHE[key] = (mtime, tok, vd)
+    return tok, vd
+
+
+def _po_attempt():
+    """yt-dlp opts carrying the PO token, or None when no token is set."""
+    tok, vd = _po_token()
+    if not tok:
+        return None
+    yt = {"po_token": [f"web.gvs+{tok}"]}
+    if vd:
+        yt["visitor_data"] = [vd]
+    return {"extractor_args": {"youtube": yt}}
 
 
 def _ladder_attempts():
     """Extra yt-dlp opts per attempt, best route first. A configured proxy
     goes first (on a blocked-IP server it is the only route that works);
-    browser cookies go last (age-restricted unlock on home connections)."""
+    a PO token (when minted) goes early — it is the direct answer to the
+    "confirm you're not a bot" check; browser cookies go last
+    (age-restricted unlock on home connections)."""
     attempts = []
     proxy = _proxy_url()
     if proxy:
         attempts.append({"proxy": proxy, "nocheckcertificate": True})
+    po = _po_attempt()
+    if po:
+        attempts.append(po)
     attempts.append({})
     attempts.append({"extractor_args": {"youtube": {"player_client": ["tv", "web_safari"]}}})
     attempts.append({"extractor_args": {"youtube": {"player_client": ["ios"]}}})
-    cfb = _cookie_browser()
-    if cfb:
+    for cfb in _cookie_browsers():
         attempts.append({"cookiesfrombrowser": cfb})
     if proxy:
         # The tunnel/proxy can flap for a few seconds (restart, reconnect);
@@ -646,8 +718,9 @@ def friendly_error(exc, url="") -> str:
     text = str(exc)
     low = text.lower()
     if "not a bot" in low or ("sign in to confirm" in low and "your age" not in low):
-        return ("YouTube is asking to confirm you're not a bot. Wait a while, or download the "
-                "video in your browser and upload the file here.")
+        return ("YouTube is asking to confirm you're not a bot. Run Mint-PO-Token.bat once "
+                "(in the ClipForge folder) and try again, or download the video in your "
+                "browser and upload the file here.")
     if "confirm your age" in low or "age-restricted" in low or "age restricted" in low:
         return ("YouTube needs a login for this video (age-restricted). "
                 "Download it in your browser while signed in, then upload the file here.")

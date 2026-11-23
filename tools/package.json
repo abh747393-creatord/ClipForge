@@ -1,0 +1,1 @@
+{"dependencies":{"bgutils-js":"^1.0.0","jsdom":"^26.0.0"},"description":"Mint a YouTube WebPO (PO) token so ClipForge's yt-dlp downloads pass YouTube's bot check. Run via Mint-PO-Token.bat (Windows) or `node mint-pot.mjs`.","name":"clipforge-po-token-minter","private":true,"type":"module","version":"1.0.0"}

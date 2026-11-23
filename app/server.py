@@ -19,7 +19,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import assets, brain, captions, config, facecam, jobs, layouts, live, llm, media, presets, preview, publish
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 UPLOAD_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 STATIC_FILES = {"style.css", "app.js"}
 
@@ -864,7 +864,7 @@ async def phone_login(payload: dict):
 
 
 def main() -> None:
-    print(f"[clipforge] ClipForge v{VERSION} starting (code marker: preview-frame-diag-1)",
+    print(f"[clipforge] ClipForge v{VERSION} starting (code marker: po-token-1)",
           flush=True)
     for line in assets.ensure_assets():
         print(f"[clipforge] {line}")
