@@ -386,6 +386,56 @@ def frame_at(src, t, out_jpg, width=960) -> Path:
     return out_jpg
 
 
+def preview_frame(url, out_jpg, meta=None, width=960) -> Path:
+    """A REAL frame from the video at `url` (not the thumbnail), so the user
+    can drag-select the facecam/gameplay sections on the actual layout.
+
+    Resolves a direct stream URL through the retry ladder, then grabs one
+    frame with ffmpeg. Live streams: the current frame. VODs: ~10% in
+    (past intros), clamped to 3–30 s. When a proxy is configured the frame
+    fetch goes through it too — signed stream URLs are bound to the egress
+    IP that resolved them. Raises on failure (callers fall back to the
+    thumbnail)."""
+    def fetch(extra):
+        opts = {"format": "b[height<=720]/bv*[height<=720]+ba/b"}
+        opts.update(extra)
+        with _ydl(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    i = _with_ladder(fetch)
+    stream_url = i.get("url") or ""
+    if not stream_url:
+        for f in i.get("requested_formats") or []:
+            if f.get("url") and f.get("vcodec") not in (None, "none"):
+                stream_url = f["url"]
+                break
+    if not stream_url:
+        for f in reversed(i.get("formats") or []):
+            if f.get("url") and f.get("vcodec") not in (None, "none"):
+                stream_url = f["url"]
+                break
+    if not stream_url:
+        raise RuntimeError("No playable stream URL for a preview frame.")
+
+    is_live = bool(i.get("is_live") or (meta or {}).get("is_live"))
+    duration = float(i.get("duration") or (meta or {}).get("duration") or 0)
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    proxy = _proxy_url()
+    if proxy:
+        cmd += ["-http_proxy", proxy]
+    if not is_live:
+        t = max(3.0, min(30.0, duration * 0.1)) if duration else 10.0
+        cmd += ["-ss", f"{t:.3f}"]
+    out_jpg = Path(out_jpg)
+    out_jpg.parent.mkdir(parents=True, exist_ok=True)
+    cmd += ["-i", stream_url, "-frames:v", "1", "-vf", f"scale={int(width)}:-2",
+            "-q:v", "3", str(out_jpg)]
+    p = run(cmd, timeout=90)
+    if p.returncode != 0 or not out_jpg.is_file():
+        raise RuntimeError(f"Preview frame grab failed: {(p.stderr or '')[-500:]}")
+    return out_jpg
+
+
 def friendly_error(exc, url="") -> str:
     """Turn common yt-dlp failures into the fix the user needs.
     Ported from stream-clips media.friendly()."""
