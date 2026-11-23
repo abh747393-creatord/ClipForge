@@ -35,7 +35,7 @@ STYLES = {
                 "strong": "FF6600", "outline": 9, "pop": 112, "upper": True, "per": 2},
 }
 
-ANIMS = ("highlight", "pop_in", "one_by_one", "build_up", "full_line")
+ANIMS = ("highlight", "pop_in", "pop_in_line", "one_by_one", "build_up", "full_line")
 
 HOOK = {"font": "Poppins ExtraBold", "size": 96, "ink": "14100E", "box": "FFFFFF", "pad_x": 36, "pad_y": 22,
         "radius": 26, "max_w": 900}
@@ -174,7 +174,8 @@ def group_words(words, per, max_chars=18, gap=0.45):
     return out
 
 
-def _hook_events(hook, dur, y, width, height, hook_style="box", accent="00F0FF"):
+def _hook_events(hook, dur, y, width, height, hook_style="box", accent="00F0FF",
+                 hook_seconds=0):
     """The heading: dark text in a white rounded box that fits it, on one line
     or two balanced ones. Ported from PeakCut's _hook_events, scaled to the
     output frame (authored at 1080x1920).
@@ -207,7 +208,12 @@ def _hook_events(hook, dur, y, width, height, hook_style="box", accent="00F0FF")
     r = min(HOOK["radius"] * sx, bh / 2)
     x1, y1 = x0 + bw, y0 + bh
     n = lambda v: f"{v:.0f}"  # noqa: E731
-    span = f"{_ts(0)},{_ts(dur)}"
+    try:
+        hs = float(hook_seconds or 0)
+    except (TypeError, ValueError):
+        hs = 0.0
+    hook_end = min(dur, hs) if hs > 0 else dur
+    span = f"{_ts(0)},{_ts(hook_end)}"
     ev = []
     if hook_style == "banner":
         bar = f"m 0 {n(y0)} l {width} {n(y0)} l {width} {n(y1)} l 0 {n(y1)}"
@@ -284,16 +290,19 @@ def _clean_style_override(override):
 
 def build_ass(words_rel, dur, hook, style_name, anim, highlight_words, hook_y, cap_y,
               width=1080, height=1920, hook_enabled=True, style_override=None,
-              hook_style="box"):
+              hook_style="box", hook_seconds=0, credit=""):
     """A complete ASS document for one clip.
 
     words_rel are relative to clip start; dur is the clip length in seconds.
     hook_y / cap_y are authored in 1080x1920 space and scaled by height/1920.
     Animations: highlight (all words visible, spoken word highlighted),
-    pop_in (words appear as spoken, with a pop), one_by_one (only the spoken
+    pop_in (words appear as spoken, with a pop), pop_in_line (the whole line
+    pops in together, spoken word highlighted), one_by_one (only the spoken
     word, centred), build_up (words accumulate), full_line (static line).
     style_override: custom caption appearance merged over the named style.
     hook_style: box | neon | banner | impact (see _hook_events).
+    hook_seconds: how long the heading stays (0 = whole clip).
+    credit: small credit line pinned to the bottom edge ("" = none).
     """
     st = dict(STYLES.get(style_name, STYLES["bounce"]))
     st.update(_clean_style_override(style_override))
@@ -329,7 +338,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     hook_text = _clean(hook or "")
     if hook_enabled and hook_text:
         ev.extend(_hook_events(hook_text, dur, hook_y_s, width, height,
-                               hook_style=hook_style, accent=st["active"]))
+                               hook_style=hook_style, accent=st["active"],
+                               hook_seconds=hook_seconds))
+    credit_text = _clean(credit or "")
+    if credit_text:
+        cfs = max(18, int(round(34 * sy)))
+        ev.append(f"Dialogue: 1,{_ts(0)},{_ts(dur)},Cap,,0,0,0,,"
+                  f"{{\\an5\\pos({width // 2},{height - max(24, int(52 * sy))})\\fs{cfs}"
+                  f"\\c&HFFFFFF&\\bord2\\3c&H000000&\\shad0}}{credit_text}")
     f = _Font.get(st["font"])
     inside = []
     for w in (words_rel or []):
@@ -374,6 +390,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 ev.append(f"Dialogue: 1,{_ts(g_start)},{_ts(g_end)},Cap,,60,60,0,,"
                           f"{{\\an5\\pos({width // 2},{cap_y_s:.0f})\\q0\\fs{fs}}}{line}")
                 continue
+        if anim == "pop_in_line":
+            # The whole line pops in together when the group starts; the word
+            # being spoken is highlighted on top (NeonClipping pop_in_line).
+            line = " ".join(texts)
+            size = base_size
+            if f.width(line, size) > cap_max_w:
+                size = max(20, int(size * cap_max_w / max(1.0, f.width(line, size))))
+            cy = cap_y_s - f.cap_shift(size)
+            line_pop = "\\fscx94\\fscy94\\t(0,90,\\fscx112\\fscy112)\\t(90,200,\\fscx107\\fscy107)"
+            ev.append(f"Dialogue: 1,{_ts(g_start)},{_ts(g_end)},Cap,,0,0,0,,"
+                      f"{{\\an5\\pos({width // 2},{cy:.0f})\\fs{size}\\c&H{st['base']}&{line_pop}}}{line}")
+            # per-word highlight overlay, positioned like the highlight anim
+            gap2 = f.width("n n", size) - 2 * f.width("n", size) + (2 * st["outline"] + 6) * size / max(1, st["size"])
+            total2 = sum(f.width(t, size) for t in texts) + gap2 * (len(texts) - 1)
+            x2 = (width - total2) / 2
+            for i, (w, t) in enumerate(zip(g, texts)):
+                wd = f.width(t, size)
+                a = max(g_start, w["start"])
+                b = (g[i + 1]["start"]) if i + 1 < len(g) else g_end
+                b = max(a, min(b, g_end))
+                if b - a >= 0.02:
+                    ev.append(f"Dialogue: 2,{_ts(a)},{_ts(b)},Cap,,0,0,0,,"
+                              f"{{\\an5\\pos({x2 + wd / 2:.0f},{cy:.0f})\\fs{size}\\c&H{st['active']}&}}{t}")
+                x2 += wd + gap2
+            continue
         if anim == "full_line":
             line = " ".join(texts)
             size = base_size

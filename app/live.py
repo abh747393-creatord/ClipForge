@@ -64,11 +64,14 @@ def _iso(ts: float) -> str:
 
 
 class LiveSession:
-    def __init__(self, url: str, options: dict | None, store):
+    def __init__(self, url: str, options: dict | None, store,
+                 auto: bool = False, creator_id=None):
         self.id = uuid.uuid4().hex[:12]
         self.url = url
         self.options = jobs.clean_options(options)
         self.store = store
+        self.auto = bool(auto)            # started by the creator watcher
+        self.creator_id = creator_id
         self.status = "starting"
         self.started_at = time.time()
         self.title = ""
@@ -106,6 +109,7 @@ class LiveSession:
         self._auto_clip_walls: list = []
         self._last_schedule_at = 0.0
         self._last_spike_at = -1e9
+        self._last_clip_made_at = 0.0   # session clock of the last finished clip
         self._phrase_seen = 0
         self._facecam_checked = False
         self._chat_on = False
@@ -135,6 +139,19 @@ class LiveSession:
             except OSError:
                 pass
         self._persist()
+        # Auto-record cooldown (NeonClipping): after an auto session ends,
+        # wait 30 min before the watcher may restart this creator.
+        if self.auto and self.creator_id:
+            try:
+                with _CREATORS_LOCK:
+                    for c in CREATORS:
+                        if c.get("id") == self.creator_id:
+                            c["cooldown_until"] = time.time() + 30 * 60
+                            c["session_id"] = None
+                            _creators_save()
+                            break
+            except Exception:  # noqa: BLE001
+                pass
 
     def state(self) -> dict:
         with self._lock:
@@ -149,6 +166,8 @@ class LiveSession:
             "hype": int(self.hype),
             "error": self.error,
             "title": self.title,
+            "auto": bool(getattr(self, "auto", False)),
+            "creator_id": getattr(self, "creator_id", None),
             "rec_height": int(getattr(self, "rec_height", 0) or 0),
         }
 
@@ -388,10 +407,31 @@ class LiveSession:
             try:
                 self._scan_segments()
                 self._check_stall()
+                self._check_caps()
                 self._update_hype()
                 self._check_triggers()
             except Exception:  # noqa: BLE001 - the monitor must keep monitoring
                 pass
+
+    def _check_caps(self) -> None:
+        """Auto-record safety caps (NeonClipping): an auto session stops after
+        3 hours; any session stops when free disk drops under the guard."""
+        if self.status not in ("starting", "recording"):
+            return
+        if self.auto and self.audio_seconds > 3 * 3600:
+            print(f"[clipforge] live {self.id} hit the 3h auto-record cap — stopping", flush=True)
+            self.stop()
+            return
+        try:
+            import os as _os
+            import shutil as _shutil
+            min_gb = float(_os.environ.get("CLIPFORGE_MIN_FREE_GB") or 3)
+            free = _shutil.disk_usage(str(config.DATA_DIR)).free / 1e9
+            if free < min_gb:
+                print(f"[clipforge] live {self.id} stopped: only {free:.1f} GB free", flush=True)
+                self.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _check_stall(self) -> None:
         if self.status != "recording":
@@ -470,22 +510,42 @@ class LiveSession:
                 self._make_clip(spike_t - float(opts.get("live_before") or 24),
                                 spike_t + float(opts.get("live_after") or 14), "spike")
 
-        # phrase: someone said "clip (it|that|this)"
+        # phrase: someone said "clip (it|that|this)" or a custom trigger phrase
         with self._lock:
             new_words = self.words[self._phrase_seen:]
             self._phrase_seen = len(self.words)
         if new_words:
             text = " ".join(w["text"] for w in new_words)
             m = CLIP_RE.search(text)
+            kind = "phrase"
+            if not m:
+                # creator-defined trigger phrases (PeakCut): instant clip,
+                # no AI judging — the creator asked for it, it gets clipped.
+                low = text.lower()
+                for ph in (opts.get("trigger_words") or []):
+                    idx = low.find(str(ph).lower())
+                    if idx >= 0:
+                        class _M:  # minimal match shim
+                            def start(self): return idx
+                        m = _M()
+                        kind = "trigger"
+                        break
             if m:
                 # find the word the match starts in, for its session-clock time
                 pos = 0
                 for w in new_words:
                     if pos <= m.start() < pos + len(w["text"]) + 1:
                         t = float(w["start"])
-                        self._make_clip(t - 60, t + 15, "phrase")
+                        self._make_clip(t - 60, t + 15, kind)
                         break
                     pos += len(w["text"]) + 1
+
+        # must-clip guarantee (PeakCut): no clip for must_clip_min minutes
+        # -> force one from the recent window at a lower bar (score 40).
+        must_min = int(opts.get("must_clip_min") or 0)
+        if must_min > 0 and now > 120 and now - self._last_clip_made_at >= must_min * 60:
+            self._last_clip_made_at = now
+            self._make_clip(max(0.0, now - 75), now, "forced")
 
     # ------------------------------------------------------------------ clip making
     def _rate_limited(self) -> bool:
@@ -515,13 +575,14 @@ class LiveSession:
             raise ValueError("Nothing has been recorded yet.")
         self._make_clip(now - float(seconds), now, "manual")
 
-    def _judge_window(self, a: float, b: float, win_rel: list) -> dict:
+    def _judge_window(self, a: float, b: float, win_rel: list, min_score=None) -> dict:
         """PeakCut two-judge check. Words judge: LLM score over the window
         transcript (None when no LLM / too little speech — never blocks).
         Reaction judge: loudness + chat surge inside the window vs the
         trailing baseline, 0-100. Mode 'both' needs both; 'either' needs
         one strong pass."""
-        min_score = float(self.options.get("live_min_score") or 80)
+        if min_score is None:
+            min_score = float(self.options.get("live_min_score") or 80)
         mode = str(self.options.get("live_decide") or "either")
         words_score = None
         text = " ".join(w["text"] for w in win_rel)
@@ -622,8 +683,11 @@ class LiveSession:
             # Two-judge gate (PeakCut): when live_judge is on, an auto clip
             # must convince the words judge (LLM over the transcript) and/or
             # the reaction judge (loudness/chat surge in the window).
-            if trigger != "manual" and self.options.get("live_judge"):
-                verdict = self._judge_window(a, b, win_rel)
+            # Manual + creator trigger phrases skip judging entirely;
+            # forced (must-clip) clips pass at a lower bar (40).
+            if trigger not in ("manual", "trigger") and self.options.get("live_judge"):
+                verdict = self._judge_window(a, b, win_rel,
+                                             min_score=40 if trigger == "forced" else None)
                 clip["judges"] = verdict
                 if not verdict["passed"]:
                     clip["status"] = "rejected"
@@ -659,6 +723,7 @@ class LiveSession:
                                         words_src, src_w, src_h, self.options)
             clip.update(jobs._basename_fields(result))
             clip["status"] = "done"
+            self._last_clip_made_at = max(self._last_clip_made_at, b)
             clip["error"] = None
         except Exception as e:  # noqa: BLE001 - one failed clip must not stop the session
             clip["status"] = "error"
@@ -727,8 +792,9 @@ def _reaction_score(loud_hist: list, chat_series: list, a: float, b: float) -> i
 
 
 # ---------------------------------------------------------------------- module API
-def start_session(url: str, options: dict | None, store) -> LiveSession:
-    session = LiveSession(url, options, store)
+def start_session(url: str, options: dict | None, store,
+                  auto: bool = False, creator_id=None) -> LiveSession:
+    session = LiveSession(url, options, store, auto=auto, creator_id=creator_id)
     SESSIONS[session.id] = session
     session.start()
     session._persist()
@@ -891,6 +957,8 @@ def _new_creator(platform: str, handle: str, url: str, name: str = "") -> dict:
         "name": (name or handle).strip()[:60],
         "url": url,
         "auto_record": True,
+        "options": {},        # per-creator clip options (clean_options shape)
+        "profile": {},        # {name, avatar, followers, updated}
         "is_live": False,
         "session_id": None,
         "last_checked": None,
@@ -912,6 +980,8 @@ def creator_add(platform: str, handle: str, name: str = "") -> dict:
         c = _new_creator(plat, disp, url, name)
         CREATORS.append(c)
         _creators_save()
+        threading.Thread(target=_enrich_profile, args=(dict(c),),
+                         daemon=True, name="creator-profile").start()
         return dict(c)
 
 
@@ -932,14 +1002,73 @@ def _active_session_for(url: str):
     return None
 
 
+def _channel_url(creator: dict) -> str:
+    """The creator's channel page (live URL without the /live suffix)."""
+    url = str(creator.get("url") or "")
+    return url[:-5] if url.endswith("/live") else url
+
+
+def _enrich_profile(creator: dict) -> None:
+    """Fetch channel name / avatar / follower count (PeakCut creator cards).
+    Best-effort, runs in a background thread; stores creator['profile']."""
+    try:
+        info = media.info(_channel_url(creator))
+        profile = {
+            "name": str(info.get("channel") or info.get("uploader") or "")[:60],
+            "avatar": str(info.get("thumbnail") or ""),
+            "followers": info.get("channel_follower_count"),
+            "updated": time.time(),
+        }
+        if not profile["avatar"]:
+            thumbs = info.get("thumbnails") or []
+            if thumbs:
+                profile["avatar"] = str(thumbs[-1].get("url") or "")
+        with _CREATORS_LOCK:
+            for c in CREATORS:
+                if c.get("id") == creator.get("id"):
+                    c["profile"] = profile
+                    if profile["name"] and (not c.get("name") or c.get("name") == c.get("handle")):
+                        c["name"] = profile["name"]
+                    _creators_save()
+                    break
+    except Exception:  # noqa: BLE001 - profile is decoration
+        pass
+
+
+def creator_update(creator_id: str, patch: dict) -> dict | None:
+    """Update a creator: auto_record toggle + per-creator clip options
+    (PeakCut: each creator keeps its own style/settings)."""
+    with _CREATORS_LOCK:
+        for c in CREATORS:
+            if c.get("id") == creator_id:
+                if "auto_record" in patch:
+                    c["auto_record"] = bool(patch["auto_record"])
+                if "name" in patch:
+                    c["name"] = str(patch["name"])[:60]
+                if isinstance(patch.get("options"), dict):
+                    c["options"] = jobs.clean_options(patch["options"])
+                _creators_save()
+                return dict(c)
+    return None
+
+
 def creator_check(creator: dict, store) -> dict:
     """Check one creator right now. If live and not already recording, start
-    the live recording session immediately (real-time, like PeakCut)."""
+    the live recording session immediately (real-time, like PeakCut).
+    Respects the 30-min cooldown after an auto session ends, and records
+    with the creator's own saved options."""
     url = creator.get("url") or ""
-    live_now = _is_live(url) if url else False
+    live_info = {}
+    try:
+        live_info = media.info(url) if url else {}
+    except Exception:  # noqa: BLE001
+        live_info = {}
+    live_now = bool(live_info.get("is_live"))
     session = _active_session_for(url)
-    if live_now and session is None and creator.get("auto_record", True):
-        session = start_session(url, {}, store)
+    cooling = float(creator.get("cooldown_until") or 0) > time.time()
+    if live_now and session is None and creator.get("auto_record", True) and not cooling:
+        opts = dict(creator.get("options") or {})
+        session = start_session(url, opts, store, auto=True, creator_id=creator.get("id"))
         print(f"[clipforge] creator {creator.get('handle')} is LIVE — recording started ({session.id})", flush=True)
     with _CREATORS_LOCK:
         for c in CREATORS:
@@ -947,6 +1076,13 @@ def creator_check(creator: dict, store) -> dict:
                 c["is_live"] = bool(live_now)
                 c["session_id"] = session.id if session else None
                 c["last_checked"] = datetime.now(timezone.utc).isoformat()
+                if live_now:
+                    c["live_title"] = str(live_info.get("title") or "")[:120]
+                    c["viewers"] = live_info.get("concurrent_view_count") or live_info.get("view_count")
+                prof = c.get("profile") or {}
+                if time.time() - float(prof.get("updated") or 0) > 600:
+                    threading.Thread(target=_enrich_profile, args=(dict(c),),
+                                     daemon=True, name="creator-profile").start()
                 _creators_save()
                 return dict(c)
     return dict(creator, is_live=bool(live_now), session_id=session.id if session else None)
@@ -1021,7 +1157,7 @@ def watch_loop(store, interval: int = 60) -> None:
                     if url in active:
                         continue
                     if _is_live(url):
-                        start_session(url, {}, store)
+                        start_session(url, {}, store, auto=True)
         except Exception:  # noqa: BLE001 - the watcher must keep watching
             pass
         time.sleep(interval)

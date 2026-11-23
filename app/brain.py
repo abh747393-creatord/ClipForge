@@ -573,3 +573,156 @@ def describe(words_rel, fallback_title="") -> dict:
             "caption": caption, "why": why,
             "hashtags": _hashtags.make(title, text, ""),
             "highlight_words": _highlight_words(words_rel)}
+
+
+# ------------------------------------------------ caption fix + translation
+# (PeakCut brain.fix_caption_words / translate_caption_words parity)
+
+def _same_word(a, b) -> bool:
+    """PeakCut's identity check for caption fixes: the replacement must still
+    be recognisably the same word (difflib ratio >= 0.45) or a digit form of
+    it — the AI may fix spelling, never rewrite the sentence."""
+    import difflib
+    a = re.sub(r"[^\w']", "", str(a or "").lower())
+    b = re.sub(r"[^\w']", "", str(b or "").lower())
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if a.isdigit() or b.isdigit():
+        return a.replace(",", "") == b.replace(",", "")
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.45
+
+
+def fix_caption_words(words_rel) -> list:
+    """AI spelling/number/punctuation fix for one clip's caption words
+    (PeakCut): one LLM call returns exactly one string per input word; any
+    word that fails the identity check keeps its original text. Timings are
+    untouched. Returns the input unchanged on any failure."""
+    words_rel = [dict(w) for w in (words_rel or [])]
+    if len(words_rel) < 3 or not llm.available():
+        return words_rel
+    try:
+        texts = [str(w.get("text") or "") for w in words_rel]
+        prompt = (
+            "Fix the spelling, capitalisation, numbers and punctuation of these "
+            "caption words from a speech transcript. Keep the SAME words in the "
+            "SAME order — do not add, remove or rewrite words. Reply ONLY with a "
+            "JSON object: {\"words\": [\"word1\", \"word2\", ...]} with exactly "
+            f"{len(texts)} entries.\n\nWords: " + " | ".join(texts))
+        out = llm.complete_json(prompt, max_tokens=1200, temperature=0.1,
+                                purpose="caption wording fix")
+        fixed = (out or {}).get("words")
+        if not isinstance(fixed, list) or len(fixed) != len(texts):
+            return words_rel
+        for w, orig, new in zip(words_rel, texts, fixed):
+            new = str(new or "").strip()
+            if new and _same_word(orig, new):
+                w["text"] = new
+        return words_rel
+    except Exception:
+        return words_rel
+
+
+def translate_words(words_rel) -> list:
+    """Translate one clip's caption words to English (PeakCut): the LLM
+    translates line by line; translated words are spread evenly over each
+    original line's timings. Returns the input unchanged on any failure."""
+    words_rel = [dict(w) for w in (words_rel or [])]
+    if len(words_rel) < 3 or not llm.available():
+        return words_rel
+    try:
+        lines = _sentences(words_rel)
+        if not lines:
+            lines = [words_rel]
+        numbered = "\n".join(
+            f"{i + 1}. " + " ".join(str(w.get("text") or "") for w in line)
+            for i, line in enumerate(lines))
+        prompt = (
+            "Translate each numbered line to natural English. Reply ONLY with a "
+            "JSON object: {\"lines\": [\"translation of line 1\", ...]} with "
+            f"exactly {len(lines)} entries.\n\n{numbered}")
+        out = llm.complete_json(prompt, max_tokens=1500, temperature=0.2,
+                                purpose="caption translation")
+        translated = (out or {}).get("lines")
+        if not isinstance(translated, list) or len(translated) != len(lines):
+            return words_rel
+        result = []
+        for line, text in zip(lines, translated):
+            text = str(text or "").strip()
+            if not text or not line:
+                continue
+            start = float(line[0]["start"])
+            end = float(line[-1]["end"])
+            toks = text.split()
+            span = max(0.05, end - start)
+            step = span / max(1, len(toks))
+            for j, tok in enumerate(toks):
+                result.append({"start": round(start + j * step, 3),
+                               "end": round(start + (j + 1) * step, 3),
+                               "text": tok})
+        return result or words_rel
+    except Exception:
+        return words_rel
+
+
+# ------------------------------------------------------- vision review
+# (NeonClipping vision.py parity: 3 frames per candidate -> descriptions ->
+# re-judge; needs a vision-capable LLM, off unless requested.)
+
+def vision_rerank(clips, src, words, work_dir, limit=8) -> list:
+    """Re-score the top candidates with visual evidence. For each clip, 3
+    frames (15/50/85%) are described by the vision LLM, then the clip is
+    re-judged on transcript + observations and scores are blended
+    (0.7 old + 0.3 new). Fail-soft: returns clips unchanged on any problem."""
+    clips = [dict(c) for c in (clips or [])]
+    if not clips or src is None or not llm.available():
+        return clips
+    try:
+        from pathlib import Path as _P
+        from . import media as _media
+        work_dir = _P(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        ranked = sorted(range(len(clips)),
+                        key=lambda i: float(clips[i].get("score") or 0), reverse=True)
+        for rank, i in enumerate(ranked[:max(1, int(limit))]):
+            clip = clips[i]
+            start, end = float(clip.get("start") or 0), float(clip.get("end") or 0)
+            if end - start < 2:
+                continue
+            frames = []
+            for k, frac in enumerate((0.15, 0.5, 0.85)):
+                fp = work_dir / f"vision_{rank}_{k}.jpg"
+                try:
+                    _media.frame_at(src, start + (end - start) * frac, fp, width=640)
+                    frames.append(fp)
+                except Exception:
+                    pass
+            if not frames:
+                continue
+            desc = llm.complete_vision(
+                "Describe only what is visibly present in these video frames, "
+                "one short sentence per frame, in order. Do not infer a story, "
+                "names, or anything not visible.", frames,
+                max_tokens=250, purpose="vision review")
+            if not desc:
+                continue
+            clip["visual_review"] = str(desc)[:600]
+            clip_words = [w for w in (words or [])
+                          if start <= float(w.get("start") or 0) < end]
+            text = " ".join(str(w.get("text") or "") for w in clip_words)
+            out = llm.complete_json(
+                "Score this short-video moment 0-100 for how well it would hold "
+                "a stranger's attention. Use BOTH the transcript and the visual "
+                "observations. Reply ONLY with JSON: {\"score\": 0-100}.\n\n"
+                f"Visual observations: {clip['visual_review']}\n\n"
+                f"Transcript: {text[:1500]}",
+                max_tokens=120, temperature=0.2, purpose="vision review")
+            new = (out or {}).get("score")
+            if isinstance(new, (int, float)):
+                old = float(clip.get("score") or 0)
+                clip["score"] = round(0.7 * old + 0.3 * max(0.0, min(100.0, float(new))), 1)
+                clip["viral_score"] = clip["score"]
+        return clips
+    except Exception:
+        return clips

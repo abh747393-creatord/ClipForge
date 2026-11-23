@@ -20,6 +20,7 @@ absolute words. On the fast path the words are shifted by the section offset
 """
 import copy
 import json
+import os
 import shutil
 import threading
 import time
@@ -79,6 +80,19 @@ DEFAULT_OPTIONS = {
     "description_text": "",    # fixed description for every clip (campaigns)
     "caption_custom": {},      # custom caption appearance (font/size/colours/per/outline)
     "hook_style": "box",       # box | neon | banner | impact
+    "hook_seconds": 0,         # heading display time (0 = whole clip; else 2-60 s)
+    "credit_text": "",         # credit line pinned to the bottom ("" = none)
+    "credit_auto": False,      # credit = "Clip: <channel>" from the source
+    "bg_card": {"mode": "none", "color": "#101418", "padding": 40, "radius": 28,
+                "image": None, "dim": 0.25, "blur": 18},  # background card
+    "template_name": "",       # X/TikTok template display name
+    "template_handle": "",     # X/TikTok template @handle
+    "caption_fix": False,      # AI spelling/number fix for caption words
+    "caption_lang": "original",  # original | english (translate captions)
+    "trigger_words": "",       # live: phrases that instantly clip (comma/newline)
+    "must_clip_min": 0,        # live: force a clip if none in N minutes (0 = off)
+    "vision_review": False,    # LLM vision re-judge of top candidates (needs vision model)
+    "new_only": False,         # only clip past the last processed position for this URL
     "cam_fx": "unsharp=5:5:0.8:5:5:0.0",  # facecam-only colour/clarity filter chain
     "fade": False,             # fade picture+sound in/out
     "outro_text": "",          # outro ribbon text over the last 3 s
@@ -153,7 +167,7 @@ def clean_options(raw: dict | None) -> dict:
     opts = copy.deepcopy(DEFAULT_OPTIONS)
     if isinstance(raw, dict):
         for k, v in raw.items():
-            if k in ("watermark", "music", "gta_overlay", "campaign") and isinstance(v, dict):
+            if k in ("watermark", "music", "gta_overlay", "campaign", "bg_card") and isinstance(v, dict):
                 merged = dict(opts.get(k) or {})
                 merged.update(v)
                 opts[k] = merged
@@ -206,8 +220,33 @@ def clean_options(raw: dict | None) -> dict:
     mu["volume"] = _clamp(mu.get("volume"), 0.0, 1.0, 0.15)
     opts["music"] = mu
 
-    if opts.get("template") not in (None, "news"):
+    if opts.get("template") not in (None, "news", "x_light", "x_dark", "tiktok"):
         opts["template"] = None
+    opts["template_name"] = str(opts.get("template_name") or "")[:40]
+    opts["template_handle"] = str(opts.get("template_handle") or "")[:40]
+    hs = _clamp(opts.get("hook_seconds"), 0, 60, 0)
+    opts["hook_seconds"] = 0 if hs < 2 else int(hs)
+    opts["credit_text"] = str(opts.get("credit_text") or "")[:80]
+    opts["credit_auto"] = bool(opts.get("credit_auto"))
+    bg = dict(DEFAULT_OPTIONS["bg_card"])
+    if isinstance(opts.get("bg_card"), dict):
+        bg.update(opts["bg_card"])
+    if bg.get("mode") not in ("none", "blur", "color", "gradient", "image"):
+        bg["mode"] = "none"
+    bg["color"] = str(bg.get("color") or "#101418")[:9]
+    bg["padding"] = int(_clamp(bg.get("padding"), 0, 200, 40))
+    bg["radius"] = int(_clamp(bg.get("radius"), 0, 120, 28))
+    bg["dim"] = _clamp(bg.get("dim"), 0.0, 0.9, 0.25)
+    bg["blur"] = int(_clamp(bg.get("blur"), 0, 60, 18))
+    bg["image"] = bg.get("image") if isinstance(bg.get("image"), str) and bg.get("image") else None
+    opts["bg_card"] = bg
+    opts["caption_fix"] = bool(opts.get("caption_fix"))
+    if opts.get("caption_lang") not in ("original", "english"):
+        opts["caption_lang"] = "original"
+    opts["trigger_words"] = str(opts.get("trigger_words") or "")[:300]
+    opts["must_clip_min"] = int(_clamp(opts.get("must_clip_min"), 0, 120, 0))
+    opts["vision_review"] = bool(opts.get("vision_review"))
+    opts["new_only"] = bool(opts.get("new_only"))
     lang = opts.get("language")
     opts["language"] = lang if isinstance(lang, str) and lang else None
     for k in ("hinglish", "use_llm", "captions", "hook_enabled",
@@ -512,10 +551,82 @@ def _cam_memory_set(source: dict, rect: dict) -> None:
         pass
 
 
-def submit(job: dict, store: JobStore) -> None:
-    """Run the job on the shared 2-worker pool. run_job handles its own errors;
-    this wrapper is the backstop so a job can never die silently."""
+# ------------------------------------------------------------------ job queue
+# Pause/resume + scheduling + load gate (NeonClipping queue parity). Jobs
+# submitted while paused (or before their scheduled time, or while the
+# machine is overloaded) wait in _pending; a pump thread releases them.
+_QUEUE_PAUSED = False
+_pending: list = []
+_pending_lock = threading.Lock()
 
+
+def queue_paused() -> bool:
+    return _QUEUE_PAUSED
+
+
+def set_queue_paused(paused: bool) -> bool:
+    global _QUEUE_PAUSED
+    _QUEUE_PAUSED = bool(paused)
+    return _QUEUE_PAUSED
+
+
+def _scheduled_due(job: dict) -> bool:
+    raw = job.get("scheduled_at")
+    if not raw:
+        return True
+    try:
+        from datetime import datetime, timezone
+        when = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) >= when
+    except (ValueError, TypeError):
+        return True
+
+
+def _load_ok() -> bool:
+    """Load gate: hold new jobs while the machine is saturated or nearly
+    out of disk (NeonClipping)."""
+    try:
+        load1 = os.getloadavg()[0]
+        if load1 > (os.cpu_count() or 4) * 1.5:
+            return False
+    except (AttributeError, OSError):
+        pass
+    try:
+        if shutil.disk_usage(str(config.DATA_DIR)).free < 1e9:
+            return False
+    except OSError:
+        pass
+    return True
+
+
+def _queue_pump() -> None:
+    while True:
+        time.sleep(5)
+        try:
+            with _pending_lock:
+                waiting = list(_pending)
+            for job, store in waiting:
+                if not (store.dir_for(job["id"]) / "job.json").exists():
+                    with _pending_lock:
+                        if (job, store) in _pending:
+                            _pending.remove((job, store))
+                    continue  # deleted while waiting
+                if _QUEUE_PAUSED or not _scheduled_due(job) or not _load_ok():
+                    continue
+                with _pending_lock:
+                    if (job, store) in _pending:
+                        _pending.remove((job, store))
+                _submit_now(job, store)
+        except Exception:  # noqa: BLE001 - the pump must keep pumping
+            pass
+
+
+threading.Thread(target=_queue_pump, daemon=True, name="clipforge-queue").start()
+
+
+def _submit_now(job: dict, store: JobStore) -> None:
     def _run():
         try:
             run_job(job, store)
@@ -529,6 +640,61 @@ def submit(job: dict, store: JobStore) -> None:
                 pass
 
     _executor.submit(_run)
+
+
+def submit(job: dict, store: JobStore) -> None:
+    """Queue the job on the shared 2-worker pool, honoring pause, schedule
+    and the load gate. run_job handles its own errors; _submit_now's wrapper
+    is the backstop so a job can never die silently."""
+    if _QUEUE_PAUSED or not _scheduled_due(job) or not _load_ok():
+        with _pending_lock:
+            if (job, store) not in _pending:
+                _pending.append((job, store))
+        job["status"] = "queued"
+        job["stage"] = "paused" if _QUEUE_PAUSED else (
+            "scheduled" if not _scheduled_due(job) else "waiting for load")
+        store.save(job)
+        return
+    _submit_now(job, store)
+
+
+def retry_job(job: dict, store: JobStore) -> dict:
+    """Re-run a failed/cancelled job from the top (NeonClipping retry)."""
+    job["status"] = "queued"
+    job["stage"] = "queued"
+    job["progress"] = 0.0
+    job["error"] = None
+    job["cancelled"] = False
+    job["clips"] = []
+    store.save(job)
+    submit(job, store)
+    return job
+
+
+def watchdog_loop(store: JobStore, stuck_sec: int = 25 * 60) -> None:
+    """Stuck-job watchdog (NeonClipping): a job whose job.json has not been
+    touched for `stuck_sec` while in an active stage is marked error so it
+    never sits 'running' forever."""
+    active = ("running", "downloading", "transcribing", "finding", "rendering")
+    while True:
+        time.sleep(60)
+        try:
+            for job in store.list():
+                if job.get("status") not in active:
+                    continue
+                p = store.dir_for(job["id"]) / "job.json"
+                try:
+                    age = time.time() - p.stat().st_mtime
+                except OSError:
+                    continue
+                if age > stuck_sec:
+                    job["status"] = "error"
+                    job["stage"] = "error"
+                    job["error"] = f"stuck — no progress for {int(age // 60)} min (watchdog)"
+                    store.save(job)
+                    print(f"[clipforge] watchdog marked job {job['id']} stuck", flush=True)
+        except Exception:  # noqa: BLE001 - the watchdog must keep watching
+            pass
 
 
 def _find_or_park(job, store, jdir, words, scan, duration, options):
@@ -568,6 +734,45 @@ def _find_or_park(job, store, jdir, words, scan, duration, options):
                             manual_picks=job.get("manual_picks"))
 
 
+def _caption_words_for(job, clip, words_for_render, options, clip_src, offset, jdir):
+    """Caption-word post-processing for one clip (PeakCut parity):
+    caption_lang="english" translates the clip's words (Whisper translate
+    task when the transcript is local, LLM line translation otherwise) and
+    caption_fix runs the AI spelling fix. Words stay on the source file's
+    timeline. Fail-soft: returns the input on any problem."""
+    try:
+        if not (options.get("caption_fix") or options.get("caption_lang") == "english"):
+            return words_for_render
+        rel_start = float(clip["start"]) - offset
+        rel_end = float(clip["end"]) - offset
+        clip_words = [dict(w) for w in (words_for_render or [])
+                      if rel_start <= float(w.get("start") or 0) < rel_end]
+        if not clip_words:
+            return words_for_render
+        if options.get("caption_lang") == "english":
+            done = None
+            if job.get("transcript_from") == "whisper":
+                try:
+                    res = transcribe.transcribe(
+                        clip_src, rel_start, rel_end, jdir,
+                        language=_language_for(options), task="translate",
+                        report=_noop_report)
+                    w2 = [dict(w, start=w["start"] + rel_start, end=w["end"] + rel_start)
+                          for w in (res.get("words") or [])]
+                    if w2:
+                        done = w2
+                except Exception:  # noqa: BLE001 - fall through to LLM translation
+                    done = None
+            if done is None:
+                done = brain.translate_words(clip_words)
+            clip_words = done
+        if options.get("caption_fix"):
+            clip_words = brain.fix_caption_words(clip_words)
+        return clip_words
+    except Exception:  # noqa: BLE001 - captions must never kill a render
+        return words_for_render
+
+
 def run_job(job: dict, store: JobStore) -> None:
     jdir = job_dir(store, job)
     clips_dir = jdir / "clips"
@@ -576,6 +781,12 @@ def run_job(job: dict, store: JobStore) -> None:
     source = job["source"]
     url = source.get("url")
     is_file = source.get("type") == "file"
+    if options.get("new_only") and url and options.get("range_start") is None:
+        pos = _processed_pos(url)
+        if pos > 0:
+            options = dict(options, range_start=pos)
+            job["options"] = options
+            _note(job, store, f"new-only: skipping the first {pos:.0f}s (already processed)")
 
     try:
         _set(job, store, status="running", stage="downloading", progress=0.1, error=None)
@@ -593,7 +804,8 @@ def run_job(job: dict, store: JobStore) -> None:
 
         # Resume after manual AI picks: words + scan were persisted when the
         # job parked, so ingest/transcribe/scan are skipped entirely.
-        resume = bool(job.get("manual_picks") or job.get("review_selected")) \
+        resume = bool(job.get("manual_picks") or job.get("review_selected")
+                      or job.get("_repick")) \
             and (jdir / "words.json").exists() and (jdir / "scan.json").exists()
         if resume:
             words = json.loads((jdir / "words.json").read_text(encoding="utf-8"))
@@ -709,6 +921,7 @@ def run_job(job: dict, store: JobStore) -> None:
 
         try:
             (jdir / "words.json").write_text(json.dumps(words, ensure_ascii=False), encoding="utf-8")
+            (jdir / "scan.json").write_text(json.dumps(scan, ensure_ascii=False), encoding="utf-8")
         except OSError as e:  # quota flake: rerenders lose words, but the job itself must go on
             _note(job, store, f"could not save transcript cache: {e}")
         clips = [_prepare_clip(c, options) for c in (clips or [])]
@@ -804,6 +1017,28 @@ def run_job(job: dict, store: JobStore) -> None:
             except Exception as e:  # noqa: BLE001 - detection is best-effort
                 _note(job, store, f"facecam detection failed: {e}")
 
+        # ---------- vision review (optional, NeonClipping) ----------
+        if options.get("vision_review") and clips:
+            try:
+                for clip in clips:
+                    csrc = clip.get("src")
+                    if not csrc or not Path(str(csrc)).exists():
+                        continue
+                    coff = float(clip.get("src_offset") or 0.0)
+                    shifted = dict(clip, start=float(clip["start"]) - coff,
+                                   end=float(clip["end"]) - coff)
+                    cwords = words if coff == 0.0 else _shift_words(
+                        words, coff, float(clip.get("_sec_dur") or 0) or None)
+                    reviewed = brain.vision_rerank([shifted], Path(str(csrc)), cwords,
+                                                   jdir / "vision", limit=1)
+                    if reviewed and reviewed[0].get("visual_review"):
+                        clip["visual_review"] = reviewed[0]["visual_review"]
+                        clip["score"] = reviewed[0].get("score", clip.get("score"))
+                        clip["viral_score"] = clip["score"]
+                store.save(job)
+            except Exception as e:  # noqa: BLE001 - vision is a bonus
+                _note(job, store, f"vision review skipped: {e}")
+
         # ---------- render ----------
         _set(job, store, stage="rendering", progress=0.7)
         n = max(1, len(clips))
@@ -845,6 +1080,10 @@ def run_job(job: dict, store: JobStore) -> None:
                             words_for_render = w2
                     except Exception:  # noqa: BLE001 - keep the scan transcript
                         pass
+                words_for_render = _caption_words_for(
+                    job, clip, words_for_render, options, clip_src, offset, jdir)
+                if options.get("credit_auto") and job.get("uploader"):
+                    clip["credit"] = f"Clip: {job['uploader']}"[:80]
                 clip_for_render = dict(clip, start=float(clip["start"]) - offset,
                                        end=float(clip["end"]) - offset)
                 result = render.render_clip(clip_src, clips_dir, name, clip_for_render,
@@ -864,6 +1103,16 @@ def run_job(job: dict, store: JobStore) -> None:
         except Exception:  # noqa: BLE001 - the sheet is a bonus export
             pass
         _set(job, store, status="done", stage="done", progress=1.0)
+        if url and duration:
+            _save_processed_pos(url, duration)
+        # Disk hygiene (stream-clips): the 16 kHz working WAVs are bulky and
+        # regenerable from the kept source audio — delete them when done.
+        for pat in ("audio16.wav", "section*_16.wav"):
+            for f in jdir.glob(pat):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
         try:
             from . import extras as _extras
             done_n = sum(1 for c in clips if c.get("status") == "done")
@@ -877,6 +1126,48 @@ def run_job(job: dict, store: JobStore) -> None:
             _extras.notify("job_error", f"ClipForge: job '{job.get('title') or job['id']}' failed: {job.get('error') or e}")
         except Exception:  # noqa: BLE001
             pass
+
+
+def _processed_pos(url) -> float:
+    """Last processed position (seconds) for a source URL (stream-clips
+    --new-only): data/processed.json {url: seconds}."""
+    try:
+        data = json.loads((config.DATA_DIR / "processed.json").read_text(encoding="utf-8"))
+        return float(data.get(str(url)) or 0) if isinstance(data, dict) else 0.0
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
+def _save_processed_pos(url, seconds) -> None:
+    try:
+        p = config.DATA_DIR / "processed.json"
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        data[str(url)] = round(float(seconds or 0), 1)
+        p.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def repick(job: dict, store: JobStore) -> dict:
+    """Re-run moment picking on the cached transcript + scan (stream-clips
+    --repick): downloads and transcription are kept; only finding + rendering
+    run again. Old clips are replaced."""
+    jdir = job_dir(store, job)
+    if not ((jdir / "words.json").exists() and (jdir / "scan.json").exists()):
+        raise ValueError("this job has no cached transcript to re-pick from")
+    job["_repick"] = True
+    job["clips"] = []
+    job["status"] = "queued"
+    job["stage"] = "queued"
+    job["error"] = None
+    store.save(job)
+    submit(job, store)
+    return job
 
 
 def resume_with_picks(job: dict, store: JobStore, picks: list) -> dict:
@@ -939,6 +1230,10 @@ def _render_one_clip(job: dict, store: JobStore, clip: dict, options: dict,
         words_path = jdir / "words.json"
         words = json.loads(words_path.read_text(encoding="utf-8")) if words_path.exists() else []
         words_for_render = words if offset == 0.0 else _shift_words(words, offset, sec_dur or None)
+        words_for_render = _caption_words_for(job, clip, words_for_render, options,
+                                              src, offset, jdir)
+    if options.get("credit_auto") and job.get("uploader"):
+        clip["credit"] = f"Clip: {job['uploader']}"[:80]
 
     name = clip.get("name") or "clip01"
     clip["name"] = name

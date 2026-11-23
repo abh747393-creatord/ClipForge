@@ -260,6 +260,7 @@ def render_clip(src, out_dir, name, clip, words_abs, src_w, src_h, options):
     # Title bar (Pillow PNG, colour emoji) replaces the ASS hook box.
     use_title_bar = bool(options.get("title_bar")) and hook_enabled and bool(hook_text.strip())
     eff_words = words_rel if use_captions else []
+    credit = str(clip.get("credit") or options.get("credit_text") or "").strip()
     ass = captions.build_ass(
         eff_words, dur,
         hook_text if hook_enabled else "",
@@ -269,7 +270,9 @@ def render_clip(src, out_dir, name, clip, words_abs, src_w, src_h, options):
         pos["hook_y"], pos["caption_y"], width, height,
         hook_enabled=hook_enabled and not use_title_bar,
         style_override=options.get("caption_custom") or None,
-        hook_style=str(options.get("hook_style") or "box"))
+        hook_style=str(options.get("hook_style") or "box"),
+        hook_seconds=options.get("hook_seconds") or 0,
+        credit=credit)
 
     # Work in a short temp dir with relative names (long paths break the
     # ffmpeg ass filter on Windows; a drive colon would break its syntax).
@@ -338,6 +341,53 @@ def render_clip(src, out_dir, name, clip, words_abs, src_w, src_h, options):
                 next_idx += 1
             except Exception:  # noqa: BLE001
                 pass
+        # Template cards (NeonClipping X post / TikTok hook looks).
+        template = str(options.get("template") or "")
+        if template in ("x_light", "x_dark"):
+            try:
+                _p, bw, bh = titlecard.x_card_png(
+                    work / "xcard.png", options.get("template_name"),
+                    options.get("template_handle"),
+                    hook_text or str(clip.get("title") or ""),
+                    dark=(template == "x_dark"), width=width)
+                inputs += ["-i", str(work / "xcard.png")]
+                png_inputs["xcard"] = (next_idx, bw, bh)
+                next_idx += 1
+            except Exception:  # noqa: BLE001
+                pass
+        elif template == "tiktok" and hook_text.strip():
+            try:
+                _p, bw, bh = titlecard.tiktok_card_png(work / "ttcard.png", hook_text,
+                                                       width=width)
+                inputs += ["-i", str(work / "ttcard.png")]
+                png_inputs["ttcard"] = (next_idx, bw, bh)
+                next_idx += 1
+            except Exception:  # noqa: BLE001
+                pass
+        # Background card (NeonClipping styling): padded clip with rounded
+        # corners over a blurred / colour / gradient / image background.
+        bg_card = options.get("bg_card") if isinstance(options.get("bg_card"), dict) else {}
+        bg_mode = str(bg_card.get("mode") or "none")
+        bg_pad = max(0, round(int(bg_card.get("padding") or 40) * width / 1080))
+        bg_fw, bg_fh = width - 2 * bg_pad, height - 2 * bg_pad
+        bg_inputs = {}
+        if bg_mode in ("blur", "color", "gradient", "image") and bg_fw > 64 and bg_fh > 64:
+            try:
+                titlecard.rounded_mask_png(work / "bgmask.png", bg_fw, bg_fh,
+                                           int(bg_card.get("radius") or 28) * width / 1080)
+                inputs += ["-loop", "1", "-t", f"{dur:.2f}", "-i", str(work / "bgmask.png")]
+                bg_inputs["mask"] = next_idx
+                next_idx += 1
+                if bg_mode != "blur":
+                    titlecard.bg_png(work / "bg.png", bg_mode, bg_card.get("color"),
+                                     bg_card.get("image"), width, height,
+                                     dim=float(bg_card.get("dim") or 0.25),
+                                     blur=int(bg_card.get("blur") or 18))
+                    inputs += ["-loop", "1", "-t", f"{dur:.2f}", "-i", str(work / "bg.png")]
+                    bg_inputs["bg"] = next_idx
+                    next_idx += 1
+            except Exception:  # noqa: BLE001 - decoration; never fail a render for it
+                bg_inputs = {}
 
         # 5. Filtergraph: layout -> preset filter -> template/watermark ->
         #    PNG overlays -> campaign banner -> ASS burn (+ audio mix).
@@ -349,6 +399,33 @@ def render_clip(src, out_dir, name, clip, words_abs, src_w, src_h, options):
         if preset_filter:
             parts.append(f"[{cur}]{preset_filter}[pfx]")
             cur = "pfx"
+        if bg_inputs.get("mask") is not None:
+            blur_v = int(bg_card.get("blur") or 18)
+            dim_v = float(bg_card.get("dim") or 0.25)
+            if bg_mode == "blur":
+                parts.append(
+                    f"[{cur}]split=2[bgs][fgs];"
+                    f"[bgs]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                    f"crop={width}:{height},boxblur={blur_v}:2,eq=brightness=-{dim_v:.2f}[bg];"
+                    f"[fgs]scale={bg_fw}:{bg_fh},format=yuva420p[fg];"
+                    f"[fg][{bg_inputs['mask']}:v]alphamerge[fgm];"
+                    f"[bg][fgm]overlay={bg_pad}:{bg_pad}[bgc]")
+            else:
+                parts.append(
+                    f"[{cur}]scale={bg_fw}:{bg_fh},format=yuva420p[fg];"
+                    f"[fg][{bg_inputs['mask']}:v]alphamerge[fgm];"
+                    f"[{bg_inputs['bg']}:v][fgm]overlay={bg_pad}:{bg_pad}[bgc]")
+            cur = "bgc"
+        if "xcard" in png_inputs:
+            idx, bw, bh = png_inputs["xcard"]
+            margin = max(12, round(24 * width / 1080))
+            parts.append(f"[{cur}][{idx}:v]overlay=(W-w)/2:{margin}[xcd]")
+            cur = "xcd"
+        if "ttcard" in png_inputs:
+            idx, bw, bh = png_inputs["ttcard"]
+            ty = max(16, int(pos["hook_y"] * height / 1920) - bh // 2)
+            parts.append(f"[{cur}][{idx}:v]overlay=(W-w)/2:{ty}[ttc]")
+            cur = "ttc"
         if str(options.get("template") or "") == "news":
             bar = max(48, round(140 * height / 1920))
             title = " ".join(str(clip.get("title") or clip.get("hook") or "").split())

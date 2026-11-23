@@ -266,3 +266,6 @@ main::-webkit-scrollbar-thumb,.transcript-lines::-webkit-scrollbar-thumb,.ed-wor
 input[type=range]{cursor:pointer}
 details summary:hover{color:#b7aaff}
 .dl-row .btn:hover{background:var(--accent-soft)}
+.cr-avatar{width:40px;height:40px;border-radius:50%;object-fit:cover;margin-right:10px;flex:none}
+.ed-word.sel input{outline:2px solid var(--accent);outline-offset:1px}
+.toggle.sm{font-size:.82em}

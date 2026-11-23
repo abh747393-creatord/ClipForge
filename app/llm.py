@@ -116,7 +116,72 @@ def available() -> bool:
     return ok
 
 
-def complete(prompt, max_tokens=400, temperature=0.3):
+def _log_usage(model, purpose, prompt, reply, usage=None):
+    """Append one AI-call record to data/usage.jsonl (PeakCut usage page).
+    Token counts come from the provider response when present, else a
+    rough chars/4 estimate. Never raises."""
+    try:
+        tin = tout = 0
+        if isinstance(usage, dict):
+            tin = int(usage.get("prompt_tokens") or 0)
+            tout = int(usage.get("completion_tokens") or 0)
+        if not tin:
+            tin = max(1, len(str(prompt or "")) // 4)
+        if not tout:
+            tout = max(1, len(str(reply or "")) // 4)
+        rec = {"t": time.time(), "model": str(model or ""), "purpose": str(purpose or "llm"),
+               "tokens_in": tin, "tokens_out": tout}
+        p = config.DATA_DIR / "usage.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+def usage_summary() -> dict:
+    """AI usage totals: today, all-time, by purpose, last 30 days, recent calls."""
+    out = {"today": {"calls": 0, "tokens_in": 0, "tokens_out": 0},
+           "total": {"calls": 0, "tokens_in": 0, "tokens_out": 0},
+           "by_purpose": {}, "daily": {}, "recent": []}
+    try:
+        p = config.DATA_DIR / "usage.jsonl"
+        if not p.is_file():
+            return out
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        rows = []
+        for line in p.read_text(encoding="utf-8").splitlines()[-5000:]:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+        for r in rows:
+            tin, tout = int(r.get("tokens_in") or 0), int(r.get("tokens_out") or 0)
+            out["total"]["calls"] += 1
+            out["total"]["tokens_in"] += tin
+            out["total"]["tokens_out"] += tout
+            day = time.strftime("%Y-%m-%d", time.localtime(float(r.get("t") or 0)))
+            d = out["daily"].setdefault(day, {"calls": 0, "tokens_in": 0, "tokens_out": 0})
+            d["calls"] += 1
+            d["tokens_in"] += tin
+            d["tokens_out"] += tout
+            if day == today:
+                out["today"]["calls"] += 1
+                out["today"]["tokens_in"] += tin
+                out["today"]["tokens_out"] += tout
+            bp = out["by_purpose"].setdefault(str(r.get("purpose") or "llm"),
+                                              {"calls": 0, "tokens_in": 0, "tokens_out": 0})
+            bp["calls"] += 1
+            bp["tokens_in"] += tin
+            bp["tokens_out"] += tout
+        out["daily"] = dict(sorted(out["daily"].items())[-30:])
+        out["recent"] = rows[-15:][::-1]
+    except Exception:
+        pass
+    return out
+
+
+def complete(prompt, max_tokens=400, temperature=0.3, purpose="llm"):
     """One chat completion → message content string, or None on any failure."""
     try:
         s = settings()
@@ -135,15 +200,59 @@ def complete(prompt, max_tokens=400, temperature=0.3):
             return None
         data = r.json()
         content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-        return content if isinstance(content, str) and content.strip() else None
+        if isinstance(content, str) and content.strip():
+            _log_usage(model, purpose, prompt, content, data.get("usage"))
+            return content
+        return None
     except Exception:
         return None
 
 
-def complete_json(prompt, max_tokens=500, temperature=0.25):
+def complete_vision(prompt, image_paths, max_tokens=300, temperature=0.2, purpose="vision"):
+    """One vision chat completion (OpenAI-compatible image_url parts, base64).
+    Returns the message content or None on any failure (e.g. text-only model)."""
+    try:
+        import base64
+        from pathlib import Path
+        s = settings()
+        base = (s.get("base_url") or _DEFAULT_BASE).rstrip("/")
+        model = s.get("model") or _DEFAULT_MODEL
+        headers = {"Content-Type": "application/json"}
+        if s.get("key"):
+            headers["Authorization"] = f"Bearer {s['key']}"
+        parts = [{"type": "text", "text": str(prompt)}]
+        for pth in image_paths or []:
+            p = Path(str(pth))
+            if not p.is_file():
+                continue
+            mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+            b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+            parts.append({"type": "image_url",
+                          "image_url": {"url": f"data:{mime};base64,{b64}"}})
+        if len(parts) < 2:
+            return None
+        payload = {"model": model,
+                   "messages": [{"role": "user", "content": parts}],
+                   "max_tokens": int(max_tokens), "temperature": float(temperature),
+                   "stream": False}
+        with _client(120.0) as c:
+            r = c.post(f"{base}/chat/completions", json=payload, headers=headers)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+        if isinstance(content, str) and content.strip():
+            _log_usage(model, purpose, prompt, content, data.get("usage"))
+            return content
+        return None
+    except Exception:
+        return None
+
+
+def complete_json(prompt, max_tokens=500, temperature=0.25, purpose="llm"):
     """complete() + tolerant JSON extraction: strips ``` fences, finds the
     first {...} block, json.loads it. Returns dict or None on any failure."""
-    text = complete(prompt, max_tokens=max_tokens, temperature=temperature)
+    text = complete(prompt, max_tokens=max_tokens, temperature=temperature, purpose=purpose)
     if not text:
         return None
     try:

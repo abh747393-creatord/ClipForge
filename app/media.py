@@ -7,6 +7,7 @@ dependency: WAV loading uses the stdlib wave module.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import wave
@@ -14,6 +15,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import numpy as np
+
+from . import config
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -308,12 +311,51 @@ def _progress_hook(progress_cb):
     return hook
 
 
+def _cache_dir(url, kind, height=0):
+    """Import cache (NeonClipping): one shared download per URL+kind+height
+    under DATA_DIR/cache, reused by later jobs on the same source."""
+    import hashlib
+    key = hashlib.sha1(f"{kind}|{height}|{url}".encode("utf-8")).hexdigest()[:20]
+    return config.DATA_DIR / "cache" / key
+
+
+def _cache_take(url, kind, height, dest_dir, stem):
+    """Copy a cached download into dest_dir; return the Path or None."""
+    try:
+        cdir = _cache_dir(url, kind, height)
+        hits = sorted(cdir.glob(f"{stem}.*")) if cdir.is_dir() else []
+        hits = [h for h in hits if h.is_file() and h.stat().st_size > 0]
+        if not hits:
+            return None
+        dest = Path(dest_dir) / hits[0].name
+        if dest.resolve() != hits[0].resolve():
+            shutil.copyfile(hits[0], dest)
+        return dest
+    except OSError:
+        return None
+
+
+def _cache_put(url, kind, height, path):
+    try:
+        cdir = _cache_dir(url, kind, height)
+        cdir.mkdir(parents=True, exist_ok=True)
+        dest = cdir / Path(path).name
+        if Path(path).resolve() != dest.resolve():
+            shutil.copyfile(path, dest)
+    except OSError:
+        pass
+
+
 def download(url, dest_dir, height=1080, progress_cb=None) -> Path:
     """Download a video (H.264 ≤height + m4a audio preferred), merged to mp4.
     Retries through the player-client ladder on bot-check errors.
-    progress_cb(fraction 0..1) is called as bytes arrive. Returns the file Path."""
+    progress_cb(fraction 0..1) is called as bytes arrive. Returns the file Path.
+    A previous download of the same URL at the same height is reused."""
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
+    hit = _cache_take(url, "video", height, dest_dir, "source")
+    if hit is not None:
+        return hit
 
     def fetch(extra):
         opts = {"format": _video_format(height), "merge_output_format": "mp4",
@@ -323,13 +365,19 @@ def download(url, dest_dir, height=1080, progress_cb=None) -> Path:
             ydl.download([url])
 
     _with_ladder(fetch)
-    return _newest(dest_dir, "source")
+    out = _newest(dest_dir, "source")
+    _cache_put(url, "video", height, out)
+    return out
 
 
 def download_audio(url, dest_dir, progress_cb=None) -> Path:
-    """Audio only: a few seconds even for long videos. Returns the file Path."""
+    """Audio only: a few seconds even for long videos. Returns the file Path.
+    Reuses the import cache when the same URL was downloaded before."""
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
+    hit = _cache_take(url, "audio", 0, dest_dir, "audio_src")
+    if hit is not None:
+        return hit
 
     def fetch(extra):
         opts = {"format": "ba[ext=m4a]/ba/worst", "outtmpl": str(dest_dir / "audio_src.%(ext)s"),
@@ -339,7 +387,9 @@ def download_audio(url, dest_dir, progress_cb=None) -> Path:
             ydl.download([url])
 
     _with_ladder(fetch)
-    return _newest(dest_dir, "audio_src")
+    out = _newest(dest_dir, "audio_src")
+    _cache_put(url, "audio", 0, out)
+    return out
 
 
 def download_section(url, dest_dir, start, end, height=1080) -> Path:

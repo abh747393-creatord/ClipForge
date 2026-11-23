@@ -19,13 +19,16 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import assets, brain, captions, config, facecam, jobs, layouts, live, llm, media, presets, preview, publish
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 UPLOAD_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 STATIC_FILES = {"style.css", "app.js"}
 
 config.ensure_dirs()
 store = jobs.JobStore()
 store.load_existing()
+import threading as _threading
+_threading.Thread(target=jobs.watchdog_loop, args=(store,), daemon=True,
+                  name="clipforge-watchdog").start()
 live.load_past_sessions()   # past live sessions + clips survive restarts
 live.init_creators()        # saved creators (imports legacy watchlist.txt once)
 live.start_watcher(store)
@@ -231,6 +234,9 @@ async def create_job(payload: dict):
         raise HTTPException(400, "That link is not supported.")
     source = {"type": "url", "url": url, "path": None, "name": url}
     job = store.create(source, payload.get("options"))
+    if payload.get("scheduled_at"):
+        job["scheduled_at"] = str(payload["scheduled_at"])[:40]
+        store.save(job)
     jobs.submit(job, store)
     return job
 
@@ -799,6 +805,9 @@ async def get_settings():
         "has_telegram_token": bool(raw.get("telegram_token")),
         "has_phone_pin": bool(raw.get("phone_pin")),
         "auto_record": bool(raw.get("auto_record")),
+        "digest_webhook": raw.get("digest_webhook") or "",
+        "digest_hour": raw.get("digest_hour", -1),
+        "keep_awake": bool(raw.get("keep_awake")),
     }
 
 
@@ -839,8 +848,228 @@ async def put_settings(payload: dict):
                 data["phone_secret"] = uuid.uuid4().hex
     if "auto_record" in payload:
         data["auto_record"] = bool(payload["auto_record"])
+    if payload.get("digest_webhook") is not None:
+        data["digest_webhook"] = str(payload["digest_webhook"])[:500]
+    if payload.get("digest_hour") is not None:
+        try:
+            data["digest_hour"] = max(-1, min(23, int(payload["digest_hour"])))
+        except (TypeError, ValueError):
+            data["digest_hour"] = -1
+    if "keep_awake" in payload:
+        data["keep_awake"] = bool(payload["keep_awake"])
     _settings_path().write_text(json.dumps(data, indent=1), encoding="utf-8")
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ queue & ops
+@app.get("/api/queue")
+async def queue_state():
+    return {"paused": jobs.queue_paused()}
+
+
+@app.post("/api/queue/pause")
+async def queue_pause(payload: dict):
+    return {"paused": jobs.set_queue_paused(bool(payload.get("paused")))}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job(job_id: str):
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.get("status") in ("queued", "running"):
+        raise HTTPException(400, "job is already active")
+    return jobs.retry_job(job, store)
+
+
+@app.post("/api/jobs/{job_id}/repick")
+async def repick_job(job_id: str):
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.get("status") in ("queued", "running"):
+        raise HTTPException(400, "job is already active")
+    try:
+        return jobs.repick(job, store)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/creators/{creator_id}")
+async def creators_update(creator_id: str, payload: dict):
+    c = live.creator_update(creator_id, payload or {})
+    if not c:
+        raise HTTPException(404, "creator not found")
+    return c
+
+
+@app.get("/api/creators/{creator_id}/clips")
+async def creator_clips(creator_id: str):
+    """Creator clip feed (PeakCut): every finished clip from this creator's
+    auto-recorded sessions, newest first."""
+    out = []
+    for s in live.list_sessions():
+        if s.get("creator_id") != creator_id:
+            continue
+        for c in s.get("clips") or []:
+            if c.get("status") == "done" and c.get("file"):
+                out.append({"session_id": s["id"], "name": c.get("name"),
+                            "title": c.get("title") or "", "score": c.get("score") or 0,
+                            "file": c.get("file"), "started_at": s.get("started_at")})
+    out.reverse()
+    return out
+
+
+@app.get("/api/usage")
+async def usage():
+    from . import llm as _llm
+    return _llm.usage_summary()
+
+
+@app.get("/api/digest")
+async def digest(send: int = 0):
+    """Today's clip summary (NeonClipping daily digest). ?send=1 also posts
+    it to the digest webhook from Settings when one is set."""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    jobs_today = [j for j in store.list()
+                  if str(j.get("created") or "").startswith(today)]
+    clips = []
+    for j in jobs_today:
+        for c in j.get("clips") or []:
+            if c.get("status") == "done":
+                clips.append({"job": j["id"], "name": c.get("name"),
+                              "title": c.get("title") or "",
+                              "score": c.get("score") or 0})
+    clips.sort(key=lambda c: -(c["score"] or 0))
+    lines = [f"ClipForge digest — {today}",
+             f"Jobs today: {len(jobs_today)} · clips ready: {len(clips)}"]
+    for c in clips[:5]:
+        lines.append(f"• [{c['score']}] {c['title'] or c['name']}")
+    text = "\n".join(lines)
+    sent = False
+    if send:
+        hook = str(_read_settings().get("digest_webhook") or "")
+        if hook:
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    hook, data=json.dumps({"content": text}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                urllib.request.urlopen(req, timeout=10)
+                sent = True
+            except Exception:  # noqa: BLE001
+                sent = False
+    return {"date": today, "jobs": len(jobs_today), "clips": len(clips),
+            "top": clips[:5], "text": text, "sent": sent}
+
+
+def _digest_loop() -> None:
+    """Daily digest at the configured hour (NeonClipping): once a day, when
+    the local hour matches settings.digest_hour, post the digest to the
+    webhook. Tracked in settings so a restart doesn't double-send."""
+    import asyncio as _aio
+    import threading as _th
+    import time as _time
+    from datetime import datetime as _dt
+
+    def _run():
+        while True:
+            _time.sleep(300)
+            try:
+                data = _read_settings()
+                hour = data.get("digest_hour", -1)
+                hook = str(data.get("digest_webhook") or "")
+                if hour is None or int(hour) < 0 or not hook:
+                    continue
+                now = _dt.now()
+                if now.hour != int(hour):
+                    continue
+                if data.get("digest_sent_on") == now.date().isoformat():
+                    continue
+                _aio.run(digest(send=1))
+                data["digest_sent_on"] = now.date().isoformat()
+                _settings_path().write_text(json.dumps(data, indent=1), encoding="utf-8")
+            except Exception:  # noqa: BLE001 - the digest must never crash the server
+                pass
+
+    _th.Thread(target=_run, daemon=True, name="clipforge-digest").start()
+
+
+@app.post("/api/update/apply")
+async def update_apply():
+    """Download the latest ClipForge from GitHub and apply it in place
+    (NeonClipping updater), then restart the server process."""
+    import threading as _th
+
+    def _apply():
+        import tempfile
+        import urllib.request
+        import zipfile
+        url = "https://github.com/abh747393-creatord/ClipForge/archive/refs/heads/main.zip"
+        root = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as td:
+            zp = Path(td) / "cf.zip"
+            urllib.request.urlretrieve(url, zp)
+            with zipfile.ZipFile(zp) as z:
+                z.extractall(td)
+            src = next(Path(td).glob("ClipForge-main"))
+            for item in ("app", "web"):
+                shutil.rmtree(root / item, ignore_errors=True)
+                shutil.copytree(src / item, root / item)
+            for item in ("VERSION", "requirements.txt", "README.md"):
+                if (src / item).exists():
+                    shutil.copyfile(src / item, root / item)
+        print("[clipforge] update applied — restarting", flush=True)
+        import os as _os
+        import sys as _sys
+        _os.execv(_sys.executable, [_sys.executable, "-m", "app"] + _sys.argv[1:])
+
+    _th.Timer(1.0, _apply).start()
+    return {"ok": True, "restarting": True}
+
+
+# ------------------------------------------------------------------ chunked upload
+@app.post("/api/upload/start")
+async def upload_start(payload: dict):
+    name = str(payload.get("name") or "video.mp4")
+    ext = Path(name).suffix.lower()
+    if ext not in UPLOAD_EXTS:
+        raise HTTPException(400, "Only .mp4, .mov, .mkv and .webm files are supported.")
+    uid = uuid.uuid4().hex
+    d = config.DATA_DIR / "uploads" / f"chunk-{uid}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "meta.json").write_text(json.dumps({"name": name, "ext": ext}), encoding="utf-8")
+    return {"upload_id": uid}
+
+
+@app.post("/api/upload/chunk")
+async def upload_chunk(request: Request, upload_id: str, index: int):
+    d = config.DATA_DIR / "uploads" / f"chunk-{upload_id}"
+    if not d.is_dir():
+        raise HTTPException(404, "upload not found")
+    body = await request.body()
+    (d / f"{index:06d}.part").write_bytes(body)
+    return {"ok": True, "bytes": len(body)}
+
+
+@app.post("/api/upload/finish")
+async def upload_finish(payload: dict):
+    uid = str(payload.get("upload_id") or "")
+    d = config.DATA_DIR / "uploads" / f"chunk-{uid}"
+    if not d.is_dir():
+        raise HTTPException(404, "upload not found")
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    dest = config.DATA_DIR / "uploads" / f"{uuid.uuid4().hex}{meta['ext']}"
+    with dest.open("wb") as out:
+        for part in sorted(d.glob("*.part")):
+            out.write(part.read_bytes())
+    shutil.rmtree(d, ignore_errors=True)
+    opts = payload.get("options") if isinstance(payload.get("options"), dict) else {}
+    source = {"type": "file", "url": None, "path": str(dest), "name": meta["name"]}
+    job = store.create(source, opts)
+    jobs.submit(job, store)
+    return job
 
 
 # ---------------------------------------------------------------------- phone remote
@@ -902,9 +1131,32 @@ async def phone_login(payload: dict):
     return resp
 
 
+def _keep_awake() -> None:
+    """Keep the PC awake while ClipForge runs (NeonClipping keep-awake).
+    Windows: SetThreadExecutionState. Linux: systemd-inhibit best-effort."""
+    try:
+        if not _read_settings().get("keep_awake"):
+            return
+        import sys as _sys
+        if _sys.platform.startswith("win"):
+            import ctypes
+            # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        else:
+            import subprocess as _sp
+            _sp.Popen(["systemd-inhibit", "--what=idle:sleep",
+                       "--why=ClipForge", "sleep", "infinity"],
+                      stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        print("[clipforge] keep-awake on", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main() -> None:
     print(f"[clipforge] ClipForge v{VERSION} starting (code marker: po-token-1)",
           flush=True)
+    _keep_awake()
+    _digest_loop()
     for line in assets.ensure_assets():
         print(f"[clipforge] {line}")
     uvicorn.run(app, host=config.HOST, port=config.PORT)

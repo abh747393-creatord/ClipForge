@@ -137,6 +137,58 @@
               <option value="en">English</option>
               <option value="hi">Hindi</option>
               <option value="hinglish">Hinglish (roman)</option>
+              <option value="ur">Urdu</option>
+              <option value="ar">Arabic</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="pt">Portuguese</option>
+              <option value="it">Italian</option>
+              <option value="nl">Dutch</option>
+              <option value="ru">Russian</option>
+              <option value="uk">Ukrainian</option>
+              <option value="pl">Polish</option>
+              <option value="tr">Turkish</option>
+              <option value="id">Indonesian</option>
+              <option value="ms">Malay</option>
+              <option value="th">Thai</option>
+              <option value="vi">Vietnamese</option>
+              <option value="ja">Japanese</option>
+              <option value="ko">Korean</option>
+              <option value="zh">Chinese</option>
+              <option value="fa">Persian</option>
+              <option value="he">Hebrew</option>
+              <option value="bn">Bengali</option>
+              <option value="ta">Tamil</option>
+              <option value="te">Telugu</option>
+              <option value="ml">Malayalam</option>
+              <option value="kn">Kannada</option>
+              <option value="mr">Marathi</option>
+              <option value="pa">Punjabi</option>
+              <option value="gu">Gujarati</option>
+              <option value="sv">Swedish</option>
+              <option value="no">Norwegian</option>
+              <option value="da">Danish</option>
+              <option value="fi">Finnish</option>
+              <option value="el">Greek</option>
+              <option value="cs">Czech</option>
+              <option value="ro">Romanian</option>
+              <option value="hu">Hungarian</option>
+              <option value="bg">Bulgarian</option>
+              <option value="hr">Croatian</option>
+              <option value="sr">Serbian</option>
+              <option value="sk">Slovak</option>
+              <option value="sl">Slovenian</option>
+              <option value="lt">Lithuanian</option>
+              <option value="lv">Latvian</option>
+              <option value="et">Estonian</option>
+              <option value="ca">Catalan</option>
+              <option value="az">Azerbaijani</option>
+              <option value="kk">Kazakh</option>
+              <option value="uz">Uzbek</option>
+              <option value="sw">Swahili</option>
+              <option value="tl">Tagalog</option>
+              <option value="ne">Nepali</option>
             </select>
           </label>
         </div>
@@ -148,6 +200,24 @@
           <label class="toggle"><input type="checkbox" id="optGameEvents" checked> Watch the game (WASTED / explosions / crashes)</label>
           <label class="toggle"><input type="checkbox" id="optReview"> Review candidates first (pick before rendering)</label>
           <label class="toggle"><input type="checkbox" id="optSkipStatic"> Skip static screens (ad breaks / BRB)</label>
+          <label class="toggle"><input type="checkbox" id="optCaptionFix"> AI caption fix (spelling &amp; names)</label>
+          <label class="toggle"><input type="checkbox" id="optVisionReview"> Vision review (AI looks at frames, re-scores clips)</label>
+          <label class="toggle"><input type="checkbox" id="optNewOnly"> New content only (skip parts already clipped)</label>
+          <label class="toggle"><input type="checkbox" id="optCreditAuto"> Auto credit line (Clip: creator name)</label>
+        </div>
+        <div class="grid3">
+          <label>Caption language
+            <select id="optCaptionLang">
+              <option value="original" selected>Original language</option>
+              <option value="english">Translate to English</option>
+            </select>
+          </label>
+          <label>Hook shows for (s, 0 = whole clip)
+            <input id="optHookSeconds" type="number" min="0" max="60" step="1" value="0">
+          </label>
+          <label>Credit text (bottom of clip)
+            <input id="optCreditText" type="text" placeholder="e.g. Clip: @streamer">
+          </label>
         </div>
         <div class="grid3">
           <label>Focus brief (optional)
@@ -263,6 +333,58 @@
       </div>
 
       <div class="card">
+        <h3>Templates &amp; background</h3>
+        <div class="grid3">
+          <label>Post template (card over the clip)
+            <select id="optTemplate">
+              <option value="" selected>None</option>
+              <option value="news">News headline</option>
+              <option value="x_light">X post (light)</option>
+              <option value="x_dark">X post (dark)</option>
+              <option value="tiktok">TikTok sticker</option>
+            </select>
+          </label>
+          <label>Template name
+            <input id="optTplName" type="text" placeholder="e.g. Ducky Bhai">
+          </label>
+          <label>Template handle
+            <input id="optTplHandle" type="text" placeholder="@handle">
+          </label>
+        </div>
+        <div class="grid3">
+          <label>Background card
+            <select id="optBgMode">
+              <option value="none" selected>None (full-bleed)</option>
+              <option value="blur">Blurred video</option>
+              <option value="color">Solid colour</option>
+              <option value="gradient">Gradient</option>
+              <option value="image">Image</option>
+            </select>
+          </label>
+          <label>Background colour <input id="optBgColor" type="color" value="#101018"></label>
+          <label>Background image
+            <input id="optBgFile" type="file" accept=".png,.jpg,.jpeg,.webp">
+            <span class="hint" id="bgHint"></span>
+          </label>
+        </div>
+        <div class="grid3">
+          <label>Padding (px)
+            <span class="slider-inline"><input type="range" id="optBgPadding" min="0" max="200" step="4" value="48"><span id="bgPaddingVal">48</span></span>
+          </label>
+          <label>Corner radius (px)
+            <span class="slider-inline"><input type="range" id="optBgRadius" min="0" max="120" step="2" value="24"><span id="bgRadiusVal">24</span></span>
+          </label>
+          <label>Dim / blur
+            <span class="slider-inline">
+              <input type="range" id="optBgDim" min="0" max="0.9" step="0.05" value="0.35" title="dim">
+              <input type="range" id="optBgBlur" min="0" max="60" step="2" value="24" title="blur">
+            </span>
+          </label>
+        </div>
+        <div class="hint">Background card puts the clip on a padded card with rounded corners (blurred video, colour, gradient or your image behind it).</div>
+      </div>
+
+      <div class="card">
         <h3>Layout</h3>
         <div class="layout-grid" id="layoutGrid"></div>
         <div id="presetRow" hidden>
@@ -338,7 +460,12 @@
         </div>
       </div>
 
-      <button class="btn primary lg" id="makeBtn">⚡ Make clips</button>
+      <div class="row wrap">
+        <button class="btn primary lg" id="makeBtn">⚡ Make clips</button>
+        <label class="field-label" style="margin:0">Schedule for later (optional)
+          <input id="optSchedule" type="datetime-local">
+        </label>
+      </div>
     </section>
 
     <!-- ============ JOB VIEW ============ -->
@@ -352,6 +479,8 @@
           <div class="row">
             <a class="btn sm" id="postingBtn" href="#" target="_blank" rel="noopener">📋 POSTING.md</a>
             <a class="btn sm" id="exportBtn" href="#" download>⬇ Export all (.zip)</a>
+            <button class="btn sm" id="retryJobBtn" hidden>↻ Retry job</button>
+            <button class="btn sm" id="repickJobBtn" hidden>🎲 Re-pick moments</button>
             <button class="btn sm" id="cancelJobBtn" hidden>Cancel job</button>
             <button class="btn sm danger" id="deleteJobBtn">Delete job</button>
           </div>
@@ -419,7 +548,7 @@
           <button class="btn sm" id="transcriptLoadBtn" type="button">Load transcript</button>
         </div>
         <div class="transcript-lines" id="transcriptLines"></div>
-        <div class="hint">Click a line to set the clip start · Shift+click sets the end.</div>
+        <div class="hint">Click a line to set the clip start · Shift+click sets the end. Keys: <b>I</b> = start at hovered line · <b>O</b> = end · <b>Space</b> = play/pause preview.</div>
         <div class="grid3">
           <label>Clip start (s) <input id="manualStart" type="number" min="0" step="0.1"></label>
           <label>Clip end (s) <input id="manualEnd" type="number" min="0" step="0.1"></label>
@@ -520,10 +649,17 @@
             <details>
               <summary>Caption words (edit text, then Save words + Re-render)</summary>
               <div class="ed-words" id="edWords"></div>
-              <div class="row">
+              <div class="row wrap">
                 <button class="btn sm" id="edSaveWords" type="button">Save words</button>
                 <button class="btn sm" id="edResetWords" type="button">Reset to transcript</button>
+                <button class="btn sm" id="edSplitWord" type="button" title="Split the selected word in two">✂ Split word</button>
+                <button class="btn sm" id="edMergeWord" type="button" title="Merge the selected word with the next">⛓ Merge with next</button>
+                <span class="row tight">
+                  <input id="edShiftAmt" type="number" step="0.1" value="0.5" size="4" title="seconds">
+                  <button class="btn sm" id="edShiftWords" type="button">Shift all words (s)</button>
+                </span>
               </div>
+              <div class="hint">Click a word to select it, then Split / Merge. Shift moves every word by the amount (use negative to move earlier).</div>
               <label>…or import subtitles (SRT / VTT / ASS, times relative to clip start)
                 <textarea id="edSubs" rows="4" placeholder="Paste subtitle text here"></textarea>
               </label>
@@ -540,6 +676,10 @@
 
     <!-- ============ LIBRARY ============ -->
     <section class="view" id="view-library" hidden>
+      <div class="row between">
+        <span class="hint">All your jobs and clips.</span>
+        <button class="btn sm" id="queuePauseBtn" type="button">⏸ Pause queue</button>
+      </div>
       <div class="library-list" id="libraryList"></div>
       <div class="hint" id="libraryEmpty" hidden>No jobs yet — make your first clips from New Job.</div>
     </section>
@@ -609,6 +749,15 @@
             </select>
           </label>
         </div>
+        <div class="grid3">
+          <label>Trigger phrases (comma separated — instant clip, no AI check)
+            <input id="liveTriggerWords" type="text" placeholder="e.g. clip it, what a play">
+          </label>
+          <label>Must-clip: force a clip if none for (min, 0 = off)
+            <input id="liveMustClip" type="number" min="0" max="120" step="1" value="0">
+          </label>
+          <label class="toggle"><input type="checkbox" id="liveEmbedOn" checked> Show stream embed while recording</label>
+        </div>
         <div class="row">
           <button class="btn primary" id="liveStartBtn">● Start live clipping</button>
           <button class="btn danger" id="liveStopBtn" disabled>Stop</button>
@@ -622,6 +771,9 @@
         <div class="row between">
           <span class="badge" id="liveStatus">starting</span>
           <span class="hint" id="liveElapsed">0:00</span>
+        </div>
+        <div id="liveEmbedWrap" hidden>
+          <iframe id="liveEmbed" style="width:100%;aspect-ratio:16/9;border:0;border-radius:8px" allow="autoplay; encrypted-media" allowfullscreen></iframe>
         </div>
         <label class="field-label">Hype</label>
         <div class="hype"><div class="hype-fill" id="hypeFill"></div></div>
@@ -666,6 +818,14 @@
           <label>Phone PIN (4–8 digits, blank = off) <input id="phonePin" type="text" inputmode="numeric" autocomplete="off"></label>
         </div>
         <label class="toggle"><input type="checkbox" id="autoRecord"> Auto-record watchlist channels when they go live</label>
+        <label class="toggle"><input type="checkbox" id="keepAwake"> Keep this PC awake while ClipForge runs</label>
+        <label class="field-label" for="digestWebhook">Daily digest webhook (optional)</label>
+        <input id="digestWebhook" type="url" placeholder="https://discord.com/api/webhooks/…" autocomplete="off">
+        <label>Send daily digest at hour (0–23, -1 = off) <input id="digestHour" type="number" min="-1" max="23" step="1" value="-1"></label>
+        <div class="row wrap">
+          <button class="btn sm" id="digestBtn" type="button">📋 Today's digest</button>
+          <span class="hint" id="digestOut"></span>
+        </div>
         <div class="hint">With a PIN set, phones on your LAN open <b>/m</b> to control live sessions. Without a PIN, only this computer can use the API.</div>
         <button class="btn primary" id="saveAlertsBtn">Save alerts</button>
       </div>
@@ -676,6 +836,7 @@
         <div class="row wrap">
           <button class="btn sm" id="readinessBtn" type="button">Re-check</button>
           <button class="btn sm" id="updateBtn" type="button">Check for updates</button>
+          <button class="btn sm" id="updateApplyBtn" type="button" hidden>⬇ Install update &amp; restart</button>
           <span class="hint" id="updateOut"></span>
           <a class="btn sm" href="/api/diagnostics" download="clipforge-diagnostics.txt">⬇ Diagnostics</a>
         </div>
@@ -688,6 +849,19 @@
         <textarea id="watchlistText" rows="5" placeholder="One per line:&#10;twitch:shroud&#10;youtube:@DuckyReloaded1&#10;kick:dasgasd3m | gta"></textarea>
         <div class="hint">Format: <code>platform:handle</code>, optionally <code>| topic</code> to only match that topic. Used by “Find streams” on the New Job tab.</div>
         <button class="btn primary" id="saveWatchlistBtn">Save watchlist</button>
+      </div>
+      <div class="card">
+        <h3>📊 AI usage</h3>
+        <div id="usageBox" class="hint">loading…</div>
+      </div>
+      <div class="card">
+        <h3>About &amp; support</h3>
+        <div class="hint">ClipForge is free and open source. If it saves you time, star the repo or report problems so they get fixed.</div>
+        <div class="row wrap">
+          <a class="btn sm" href="https://github.com/abh747393-creatord/ClipForge" target="_blank" rel="noopener">⭐ GitHub repo</a>
+          <a class="btn sm" id="reportBtn" href="https://github.com/abh747393-creatord/ClipForge/issues/new" target="_blank" rel="noopener">🐞 Report a problem</a>
+          <a class="btn sm" href="https://github.com/abh747393-creatord/ClipForge/releases" target="_blank" rel="noopener">📦 Releases</a>
+        </div>
       </div>
       <div class="card">
         <h3>Speech model</h3>

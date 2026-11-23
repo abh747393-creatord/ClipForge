@@ -212,3 +212,141 @@ def mission_card_png(path, text="MISSION COMPLETE", width=1080, size=64):
     draw.text((box_w / 2, box_h / 2), text, font=font, fill=(212, 175, 55, 255), anchor="mm")
     img.save(path)
     return path, box_w, box_h
+
+# ------------------------------------------------- templates + background card
+# (NeonClipping styling.py parity: X post / TikTok hook templates and the
+# background card behind a padded, rounded-corner clip.)
+
+def _wrap_text(draw, text, font, limit):
+    """Greedy word wrap by measured width. Returns list of line strings."""
+    words = str(text or "").split()
+    lines, cur = [], ""
+    for w in words:
+        trial = f"{cur} {w}".strip()
+        if cur and draw.textlength(trial, font=font) > limit:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    return lines or [""]
+
+
+def x_card_png(path, name, handle, text, dark=False, width=1080):
+    """An X (Twitter) post-style card: avatar circle with the initial, name,
+    @handle, a blue verified tick, and the hook text wrapped below.
+    Returns (path, width, height)."""
+    s = width / 1080.0
+    pad = int(44 * s)
+    name_f, _ = _first_font(BOLD_FONTS, int(46 * s))
+    small_f, _ = _first_font(BOLD_FONTS, int(36 * s))
+    body_f, _ = _first_font(BOLD_FONTS, int(52 * s))
+    name = (str(name or "").strip() or "ClipForge")[:40]
+    handle = str(handle or "").strip()
+    if handle and not handle.startswith("@"):
+        handle = "@" + handle
+    handle = handle[:40]
+    probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+    lines = _wrap_text(probe, text, body_f, width - 2 * pad)[:4]
+    line_h = int(52 * s * 1.25)
+    head_h = int(96 * s)
+    box_h = pad + head_h + int(18 * s) + line_h * len(lines) + pad
+    bg = (0, 0, 0, 255) if dark else (255, 255, 255, 255)
+    ink = (255, 255, 255, 255) if dark else (15, 20, 25, 255)
+    grey = (150, 150, 150, 255) if dark else (110, 118, 125, 255)
+    img = Image.new("RGBA", (width, box_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((0, 0, width, box_h), radius=int(28 * s), fill=bg)
+    # avatar: accent circle + initial letter
+    av = int(88 * s)
+    draw.ellipse((pad, pad, pad + av, pad + av), fill=(29, 155, 240, 255))
+    draw.text((pad + av / 2, pad + av / 2), name[0].upper(), font=name_f,
+              fill=(255, 255, 255, 255), anchor="mm")
+    tx = pad + av + int(24 * s)
+    draw.text((tx, pad + int(8 * s)), name, font=name_f, fill=ink, anchor="la")
+    nw = draw.textlength(name, font=name_f)
+    # verified tick
+    cx, cy, cr = tx + nw + int(26 * s), pad + int(32 * s), int(17 * s)
+    draw.ellipse((cx - cr, cy - cr, cx + cr, cy + cr), fill=(29, 155, 240, 255))
+    draw.line([(cx - cr * 0.5, cy), (cx - cr * 0.12, cy + cr * 0.42),
+               (cx + cr * 0.55, cy - cr * 0.42)], fill=(255, 255, 255, 255),
+              width=max(3, int(5 * s)))
+    if handle:
+        draw.text((tx, pad + int(58 * s)), handle, font=small_f, fill=grey, anchor="la")
+    y = pad + head_h + int(18 * s)
+    for line in lines:
+        draw.text((pad, y), line, font=body_f, fill=ink, anchor="la")
+        y += line_h
+    img.save(path)
+    return path, img.width, img.height
+
+
+def tiktok_card_png(path, text, width=1080):
+    """TikTok text-sticker look: black bold text in a white rounded box.
+    Returns (path, width, height)."""
+    s = width / 1080.0
+    size = int(56 * s)
+    font, _ = _first_font(BOLD_FONTS, size)
+    probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+    limit = width - 2 * int(width * 0.12) - 2 * int(size * 0.6)
+    lines = _wrap_text(probe, text, font, limit)[:4]
+    if not lines or not lines[0]:
+        raise ValueError("empty text")
+    pad_x, pad_y = int(size * 0.6), int(size * 0.42)
+    line_h = int(size * 1.3)
+    box_w = int(max(probe.textlength(l, font=font) for l in lines) + 2 * pad_x)
+    box_h = int(line_h * len(lines) + 2 * pad_y)
+    img = Image.new("RGBA", (box_w + 12, box_h + 12), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((8, 10, box_w + 8, box_h + 10), radius=int(size * 0.3),
+                           fill=(0, 0, 0, 70))
+    draw.rounded_rectangle((0, 0, box_w, box_h), radius=int(size * 0.3),
+                           fill=(255, 255, 255, 255))
+    for i, line in enumerate(lines):
+        draw.text((box_w / 2, pad_y + i * line_h + line_h / 2), line, font=font,
+                  fill=(10, 10, 10, 255), anchor="mm")
+    img.save(path)
+    return path, img.width, img.height
+
+
+def rounded_mask_png(path, w, h, radius):
+    """White rounded rectangle on black — the alpha mask for alphamerge."""
+    img = Image.new("L", (int(w), int(h)), 0)
+    ImageDraw.Draw(img).rounded_rectangle(
+        (0, 0, int(w), int(h)), radius=max(0, int(radius)), fill=255)
+    img.save(path)
+    return path
+
+
+def bg_png(path, mode, color, image, width, height, dim=0.25, blur=18):
+    """Background image for the background-card look: a solid colour, a
+    vertical gradient (colour -> darker), or the user's image cover-fitted
+    (optionally blurred + dimmed). Returns path."""
+    from PIL import ImageFilter
+    width, height = int(width), int(height)
+    if mode == "image" and image and Path(str(image)).is_file():
+        img = Image.open(str(image)).convert("RGB")
+        scale = max(width / img.width, height / img.height)
+        img = img.resize((max(width, int(img.width * scale)),
+                          max(height, int(img.height * scale))))
+        x = (img.width - width) // 2
+        y = (img.height - height) // 2
+        img = img.crop((x, y, x + width, y + height))
+        if blur:
+            img = img.filter(ImageFilter.GaussianBlur(radius=float(blur)))
+    elif mode == "gradient":
+        top = _hex(color)[:3]
+        bot = tuple(max(0, int(c * 0.35)) for c in top)
+        arr = np.zeros((height, width, 3), dtype=np.uint8)
+        for i in range(height):
+            t = i / max(1, height - 1)
+            arr[i, :, :] = [int(top[c] + (bot[c] - top[c]) * t) for c in range(3)]
+        img = Image.fromarray(arr, "RGB")
+    else:  # color
+        img = Image.new("RGB", (width, height), _hex(color)[:3])
+    if dim:
+        black = Image.new("RGB", (width, height), (0, 0, 0))
+        img = Image.blend(img, black, max(0.0, min(0.9, float(dim))))
+    img.save(path)
+    return path

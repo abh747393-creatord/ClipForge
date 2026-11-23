@@ -11,7 +11,7 @@ const state = {
   newRegions: { facecam: null, game: null },
   liveRegions: { facecam: null, game: null },
   editor: { jobId: null, idx: -1, clip: null, regions: { facecam: null, game: null }, words: [], previewTimer: null, previewSeq: 0, previewUrl: null },
-  logoPath: null, musicPath: null,
+  logoPath: null, musicPath: null, bgPath: null,
   liveId: null, liveSig: null,
   jobTimer: null, liveTimer: null,
   uploadFile: null,
@@ -163,6 +163,25 @@ function collectOptions() {
       opacity: parseFloat($("optWmOpacity").value) || 0.85,
       size: parseFloat($("optWmSize").value) || 0.18,
     },
+    caption_fix: $("optCaptionFix").checked,
+    caption_lang: $("optCaptionLang").value || "original",
+    vision_review: $("optVisionReview").checked,
+    new_only: $("optNewOnly").checked,
+    credit_text: $("optCreditText").value.trim(),
+    credit_auto: $("optCreditAuto").checked,
+    hook_seconds: parseInt($("optHookSeconds").value, 10) || 0,
+    template: $("optTemplate").value || null,
+    template_name: $("optTplName").value.trim(),
+    template_handle: $("optTplHandle").value.trim(),
+    bg_card: {
+      mode: $("optBgMode").value || "none",
+      color: $("optBgColor").value || "#101018",
+      padding: parseInt($("optBgPadding").value, 10) || 0,
+      radius: parseInt($("optBgRadius").value, 10) || 0,
+      dim: parseFloat($("optBgDim").value) || 0,
+      blur: parseInt($("optBgBlur").value, 10) || 0,
+      image: state.bgPath || null,
+    },
   };
 }
 function liveOptions() {
@@ -175,6 +194,8 @@ function liveOptions() {
   o.live_judge = $("liveJudge").checked;
   o.live_min_score = parseFloat($("liveMinScore").value) || 6;
   o.live_decide = $("liveDecide").value || "either";
+  o.trigger_words = $("liveTriggerWords").value.split(",").map((s) => s.trim()).filter(Boolean);
+  o.must_clip_min = parseInt($("liveMustClip").value, 10) || 0;
   return o;
 }
 
@@ -455,8 +476,10 @@ async function uploadAsset(file, hintId, kind) {
     fd.append("file", file);
     const r = await api("/api/upload-asset", { method: "POST", body: fd });
     hint.textContent = "✓ " + file.name;
-    if (kind === "logo") state.logoPath = r.path; else state.musicPath = r.path;
-    toast((kind === "logo" ? "Logo" : "Music") + " uploaded.", true);
+    if (kind === "logo") state.logoPath = r.path;
+    else if (kind === "bg") state.bgPath = r.path;
+    else state.musicPath = r.path;
+    toast((kind === "logo" ? "Logo" : kind === "bg" ? "Background" : "Music") + " uploaded.", true);
   } catch (e) {
     hint.textContent = "upload failed";
     toast(e.message);
@@ -532,29 +555,69 @@ function applyProfileOptions(opts) {
   if (opts.profile) $("optProfile").value = opts.profile;
   if (opts.facecam) { state.newRegions.facecam = opts.facecam; placeBox($("boxNewFacecam"), opts.facecam); }
   if (opts.game) { state.newRegions.game = opts.game; placeBox($("boxNewGame"), opts.game); }
+  $("optCaptionFix").checked = !!opts.caption_fix;
+  $("optVisionReview").checked = !!opts.vision_review;
+  $("optNewOnly").checked = !!opts.new_only;
+  $("optCreditAuto").checked = !!opts.credit_auto;
+  if (opts.caption_lang) $("optCaptionLang").value = opts.caption_lang;
+  if (opts.credit_text) $("optCreditText").value = opts.credit_text;
+  if (opts.hook_seconds != null) $("optHookSeconds").value = opts.hook_seconds;
+  if (opts.template) $("optTemplate").value = opts.template;
+  if (opts.template_name) $("optTplName").value = opts.template_name;
+  if (opts.template_handle) $("optTplHandle").value = opts.template_handle;
+  const bg = opts.bg_card || {};
+  if (bg.mode) $("optBgMode").value = bg.mode;
+  if (bg.color) $("optBgColor").value = bg.color;
+  if (bg.padding != null) { $("optBgPadding").value = bg.padding; $("bgPaddingVal").textContent = bg.padding; }
+  if (bg.radius != null) { $("optBgRadius").value = bg.radius; $("bgRadiusVal").textContent = bg.radius; }
+  if (bg.dim != null) $("optBgDim").value = bg.dim;
+  if (bg.blur != null) $("optBgBlur").value = bg.blur;
+  if (bg.image) state.bgPath = bg.image;
   applyCaptionCustom(opts.caption_custom || null);
   scheduleCapPreview();
+}
+async function uploadChunked(file, options) {
+  const start = await postJSON("/api/upload/start", { name: file.name });
+  const CH = 8 * 1024 * 1024;
+  const n = Math.ceil(file.size / CH);
+  for (let i = 0; i < n; i++) {
+    const part = file.slice(i * CH, (i + 1) * CH);
+    const r = await fetch("/api/upload/chunk?upload_id=" + start.upload_id + "&index=" + i,
+      { method: "POST", body: part });
+    if (!r.ok) throw new Error("upload chunk " + (i + 1) + " failed");
+    $("makeBtn").textContent = "⬆ Uploading " + Math.round(((i + 1) / n) * 100) + "%…";
+  }
+  return postJSON("/api/upload/finish", { upload_id: start.upload_id, options: options });
 }
 async function makeClips() {
   const btn = $("makeBtn");
   btn.disabled = true;
   try {
     let job;
+    const sched = $("optSchedule").value;
     if (state.uploadFile) {
-      const fd = new FormData();
-      fd.append("file", state.uploadFile);
-      fd.append("options", JSON.stringify(collectOptions()));
-      job = await api("/api/upload", { method: "POST", body: fd });
+      if (state.uploadFile.size > 40 * 1024 * 1024) {
+        job = await uploadChunked(state.uploadFile, collectOptions());
+      } else {
+        const fd = new FormData();
+        fd.append("file", state.uploadFile);
+        fd.append("options", JSON.stringify(collectOptions()));
+        job = await api("/api/upload", { method: "POST", body: fd });
+      }
     } else {
       const url = $("urlInput").value.trim();
       if (!url) { toast("Paste a video link or choose a file first."); return; }
-      job = await postJSON("/api/jobs", { url: url, options: collectOptions() });
+      const payload = { url: url, options: collectOptions() };
+      if (sched) payload.scheduled_at = new Date(sched).toISOString();
+      job = await postJSON("/api/jobs", payload);
     }
+    if (sched) toast("Job scheduled for " + new Date(sched).toLocaleString() + ".", true);
     openJob(job.id);
   } catch (e) {
     toast(e.message);
   } finally {
     btn.disabled = false;
+    btn.textContent = "⚡ Make clips";
   }
 }
 
@@ -603,6 +666,8 @@ function renderJob(job) {
   $("exportBtn").style.pointerEvents = (job.clips || []).some((c) => c.status === "done") ? "" : "none";
   $("exportBtn").style.opacity = (job.clips || []).some((c) => c.status === "done") ? "" : ".45";
   $("postingBtn").href = "/media/" + job.id + "/POSTING.md";
+  $("retryJobBtn").hidden = !["error", "cancelled"].includes(job.status);
+  $("repickJobBtn").hidden = !["done", "error", "cancelled"].includes(job.status);
   const ge = $("jobGameEvents");
   if ((job.game_events || []).length) {
     ge.hidden = false;
@@ -988,9 +1053,31 @@ async function loadEditorWords() {
     box.querySelectorAll("input").forEach((inp) => inp.addEventListener("input", () => {
       ed.words[parseInt(inp.dataset.i, 10)].word = inp.value;
     }));
+    box.querySelectorAll(".ed-word").forEach((row, i) => row.addEventListener("click", () => {
+      ed.selWord = i;
+      box.querySelectorAll(".ed-word").forEach((r) => r.classList.toggle("sel", r === row));
+    }));
   } catch (e) {
     box.innerHTML = '<div class="hint">words unavailable: ' + esc(e.message) + "</div>";
   }
+}
+function paintEditorWords() {
+  const ed = state.editor;
+  const box = $("edWords");
+  box.innerHTML = "";
+  ed.words.forEach((w, i) => {
+    const row = document.createElement("span");
+    row.className = "ed-word" + (i === ed.selWord ? " sel" : "");
+    row.innerHTML = '<input type="text" value="' + esc(w.word) + '" data-i="' + i + '"><small>' + fmtTime(w.start) + "</small>";
+    box.appendChild(row);
+  });
+  box.querySelectorAll("input").forEach((inp) => inp.addEventListener("input", () => {
+    ed.words[parseInt(inp.dataset.i, 10)].word = inp.value;
+  }));
+  box.querySelectorAll(".ed-word").forEach((row, i) => row.addEventListener("click", () => {
+    ed.selWord = i;
+    box.querySelectorAll(".ed-word").forEach((r) => r.classList.toggle("sel", r === row));
+  }));
 }
 async function editorRerender() {
   const ed = state.editor;
@@ -1051,6 +1138,8 @@ async function loadTranscript() {
     (r.lines || []).forEach((ln) => {
       const div = document.createElement("div");
       div.className = "transcript-line";
+      div.dataset.start = ln.start;
+      div.dataset.end = ln.end;
       div.innerHTML = '<span class="tl-time">' + fmtTime(ln.start) + "</span> " + esc(ln.text);
       div.addEventListener("click", (ev) => {
         if (ev.shiftKey) { $("manualEnd").value = Number(ln.end).toFixed(1); }
@@ -1119,6 +1208,27 @@ async function startLive() {
 function stopLivePolling() {
   if (state.liveTimer) { clearInterval(state.liveTimer); state.liveTimer = null; }
 }
+function embedUrlFor(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.replace(/^www\./, "");
+    if (host === "twitch.tv") {
+      const ch = u.pathname.split("/").filter(Boolean)[0];
+      if (ch) return "https://player.twitch.tv/?channel=" + ch + "&parent=" + location.hostname;
+    }
+    if (host === "kick.com") {
+      const ch = u.pathname.split("/").filter(Boolean)[0];
+      if (ch) return "https://player.kick.com/" + ch;
+    }
+    if (host.endsWith("youtube.com")) {
+      const v = u.searchParams.get("v");
+      if (v) return "https://www.youtube.com/embed/" + v + "?autoplay=1&mute=1";
+      const m = u.pathname.match(/\/channel\/(UC[\w-]+)\/live/);
+      if (m) return "https://www.youtube.com/embed/live_stream?channel=" + m[1] + "&autoplay=1&mute=1";
+    }
+  } catch (e) { /* no embed */ }
+  return "";
+}
 function renderLive(s) {
   const st = $("liveStatus");
   st.textContent = s.status;
@@ -1126,6 +1236,16 @@ function renderLive(s) {
   $("liveElapsed").textContent = fmtTime(s.elapsed);
   $("hypeFill").style.width = Math.max(0, Math.min(100, s.hype || 0)) + "%";
   $("liveTitle").textContent = (s.title || s.url || "") + (s.rec_height ? " · recording " + s.rec_height + "p" : "");
+  const embedOn = $("liveEmbedOn") && $("liveEmbedOn").checked;
+  const eurl = embedOn ? embedUrlFor(s.url || "") : "";
+  const wrap = $("liveEmbedWrap");
+  if (eurl) {
+    wrap.hidden = false;
+    const fr = $("liveEmbed");
+    if (fr.dataset.src !== eurl) { fr.src = eurl; fr.dataset.src = eurl; }
+  } else {
+    wrap.hidden = true;
+  }
   const err = $("liveError");
   err.hidden = !s.error;
   err.textContent = s.error || "";
@@ -1185,11 +1305,44 @@ async function loadCreators() {
     row.className = "lib-row";
     const live = c.is_live && c.session_id;
     const status = live ? "🔴 LIVE — recording" : (c.is_live ? "🔴 LIVE" : "⚪ offline");
-    row.innerHTML = '<div class="lib-main"><div class="lib-title">' + esc(c.name || c.handle) + '</div>' +
-      '<div class="lib-sub">' + esc(c.platform) + " · " + esc(c.handle) + " · " + status +
-      (c.last_checked ? " · checked " + esc(fmtDate(c.last_checked)) : "") + "</div></div>" +
+    const prof = c.profile || {};
+    const avatar = prof.avatar ? '<img class="cr-avatar" src="' + esc(prof.avatar) + '" alt="">' : "";
+    const followers = prof.followers ? " · " + Number(prof.followers).toLocaleString() + " followers" : "";
+    const liveInfo = c.is_live && c.live_title ? " · “" + esc(c.live_title) + "”" + (c.viewers ? " · " + Number(c.viewers).toLocaleString() + " watching" : "") : "";
+    const cooling = c.cooldown_until && c.cooldown_until * 1000 > Date.now() ? " · cooldown" : "";
+    row.innerHTML = avatar + '<div class="lib-main"><div class="lib-title">' + esc(prof.name || c.name || c.handle) + '</div>' +
+      '<div class="lib-sub">' + esc(c.platform) + " · " + esc(c.handle) + followers + " · " + status + liveInfo + cooling +
+      (c.last_checked ? " · checked " + esc(fmtDate(c.last_checked)) : "") + "</div>" +
+      '<label class="toggle sm"><input type="checkbox" class="cr-auto"' + (c.auto_record === false ? "" : " checked") + "> Auto-record</label> " +
+      '<button class="btn sm cr-saveopts" type="button" title="Save the current New Job settings as this creator\'s own clip settings">💾 Use my current settings</button> ' +
+      '<button class="btn sm cr-clips" type="button">🎬 Clips</button><div class="cr-feed" hidden></div></div>' +
       (live ? '<button class="btn sm cr-watch">Watch</button>' : '<button class="btn sm cr-check">Check now</button>') +
       '<button class="btn sm danger cr-del">Remove</button>';
+    row.querySelector(".cr-auto").addEventListener("change", async (ev) => {
+      try {
+        await api("/api/creators/" + c.id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ auto_record: ev.target.checked }) });
+        toast("Auto-record " + (ev.target.checked ? "on" : "off") + " for " + (c.name || c.handle) + ".", true);
+      } catch (e) { toast(e.message); }
+    });
+    row.querySelector(".cr-saveopts").addEventListener("click", async () => {
+      try {
+        await api("/api/creators/" + c.id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ options: liveOptions() }) });
+        toast("Saved your current settings for " + (c.name || c.handle) + " — their auto-recordings will use them.", true);
+      } catch (e) { toast(e.message); }
+    });
+    row.querySelector(".cr-clips").addEventListener("click", async () => {
+      const feed = row.querySelector(".cr-feed");
+      if (!feed.hidden) { feed.hidden = true; return; }
+      feed.hidden = false;
+      feed.innerHTML = '<div class="hint">loading clips…</div>';
+      try {
+        const clips = await api("/api/creators/" + c.id + "/clips");
+        feed.innerHTML = clips.length ? clips.map((cl) =>
+          '<div class="lib-sub">🎬 <a href="/media/live/' + cl.session_id + "/" + encodeURIComponent(cl.file.split("/").pop()) + '" target="_blank" rel="noopener">' +
+          esc(cl.title || cl.name) + "</a> · score " + (cl.score || 0) + "</div>").join("")
+          : '<div class="hint">No clips yet from this creator.</div>';
+      } catch (e) { feed.innerHTML = '<div class="hint">' + esc(e.message) + "</div>"; }
+    });
     const watch = row.querySelector(".cr-watch");
     if (watch) watch.addEventListener("click", async () => {
       try { attachLive(await api("/api/live/" + c.session_id)); }
@@ -1334,6 +1487,10 @@ async function loadSettings() {
   $("phonePin").value = "";
   $("phonePin").placeholder = s.phone_pin_set ? "•••• (saved — blank keeps it)" : "4–8 digits";
   $("autoRecord").checked = !!s.auto_record;
+  $("keepAwake").checked = !!s.keep_awake;
+  $("digestWebhook").value = s.digest_webhook || "";
+  $("digestHour").value = s.digest_hour != null ? s.digest_hour : -1;
+  loadUsage().catch(() => {});
   try {
     const providers = await api("/api/llm/providers");
     fillSelect($("llmProvider"), (providers || []).map((p) => [p.id, p.label]), "");
@@ -1376,8 +1533,19 @@ async function saveSettings() {
     });
     toast("Settings saved.", true);
     loadSettings().catch(() => {});
-    loadStatus().catch(() => {});
   } catch (e) { toast(e.message); }
+}
+async function loadUsage() {
+  const u = await api("/api/usage");
+  const box = $("usageBox");
+  if (!box) return;
+  const purposes = Object.entries(u.by_purpose || {})
+    .map(([k, v]) => k + ": " + v.calls + " calls").join(" · ");
+  const tok = (x) => Number((x && x.tokens_in) || 0) + Number((x && x.tokens_out) || 0);
+  box.textContent = "Today: " + (u.today.calls || 0) + " AI calls (~" +
+    tok(u.today).toLocaleString() + " tokens) · All time: " +
+    (u.total.calls || 0) + " calls (~" + tok(u.total).toLocaleString() +
+    " tokens)" + (purposes ? " · " + purposes : "");
 }
 async function saveAlerts() {
   try {
@@ -1385,6 +1553,9 @@ async function saveAlerts() {
       discord_webhook: $("discordWebhook").value.trim(),
       telegram_chat_id: $("telegramChat").value.trim(),
       auto_record: $("autoRecord").checked,
+      keep_awake: $("keepAwake").checked,
+      digest_webhook: $("digestWebhook").value.trim(),
+      digest_hour: parseInt($("digestHour").value, 10),
     };
     if ($("telegramToken").value) body.telegram_token = $("telegramToken").value;
     if ($("phonePin").value) body.phone_pin = $("phonePin").value.trim();
@@ -1721,7 +1892,96 @@ document.addEventListener("DOMContentLoaded", () => {
       const r = await api("/api/update-check");
       $("updateOut").textContent = r.update_available ? "update available: v" + r.latest + " (you have v" + r.local + ")" :
         (r.error ? "couldn't check (" + r.error + ")" : "up to date (v" + r.local + ")");
+      $("updateApplyBtn").hidden = !r.update_available;
     } catch (e) { $("updateOut").textContent = e.message; }
+  });
+
+    /* ---- v1.1.5 parity bindings ---- */
+  $("retryJobBtn").addEventListener("click", async () => {
+    if (!state.currentJobId) return;
+    try { await postJSON("/api/jobs/" + state.currentJobId + "/retry", {}); toast("Job queued again.", true); startJobPolling(); refreshJob().catch(() => {}); }
+    catch (e) { toast(e.message); }
+  });
+  $("repickJobBtn").addEventListener("click", async () => {
+    if (!state.currentJobId) return;
+    if (!confirm("Re-pick moments from the saved transcript? Current clips will be replaced (no re-download).")) return;
+    try { await postJSON("/api/jobs/" + state.currentJobId + "/repick", {}); toast("Re-picking moments…", true); startJobPolling(); refreshJob().catch(() => {}); }
+    catch (e) { toast(e.message); }
+  });
+  $("queuePauseBtn").addEventListener("click", async () => {
+    try {
+      const cur = await api("/api/queue");
+      const r = await postJSON("/api/queue/pause", { paused: !cur.paused });
+      $("queuePauseBtn").textContent = r.paused ? "▶ Resume queue" : "⏸ Pause queue";
+      toast(r.paused ? "Queue paused — new jobs will wait." : "Queue resumed.", true);
+    } catch (e) { toast(e.message); }
+  });
+  api("/api/queue").then((q) => { if (q.paused) $("queuePauseBtn").textContent = "▶ Resume queue"; }).catch(() => {});
+  $("optBgFile").addEventListener("change", () => { const f = $("optBgFile").files[0]; if (f) uploadAsset(f, "bgHint", "bg"); });
+  $("optBgPadding").addEventListener("input", () => { $("bgPaddingVal").textContent = $("optBgPadding").value; });
+  $("optBgRadius").addEventListener("input", () => { $("bgRadiusVal").textContent = $("optBgRadius").value; });
+  $("digestBtn").addEventListener("click", async () => {
+    try {
+      const d = await api("/api/digest?send=1");
+      $("digestOut").textContent = d.text.split("\n").slice(0, 2).join(" · ") + (d.sent ? " · sent to webhook ✓" : "");
+    } catch (e) { toast(e.message); }
+  });
+  $("updateApplyBtn").addEventListener("click", async () => {
+    if (!confirm("Download the latest ClipForge and restart? Running jobs will stop.")) return;
+    try {
+      await postJSON("/api/update/apply", {});
+      $("updateOut").textContent = "updating… the page will reload when the server is back.";
+      setTimeout(() => location.reload(), 8000);
+    } catch (e) { toast(e.message); }
+  });
+  $("edSplitWord").addEventListener("click", () => {
+    const ed = state.editor;
+    const i = ed.selWord;
+    if (i == null || !ed.words[i]) { toast("Click a word first to select it."); return; }
+    const w = ed.words[i];
+    const mid = (Number(w.start) + Number(w.end)) / 2;
+    const half = Math.max(1, Math.floor(String(w.word).length / 2));
+    ed.words.splice(i, 1,
+      { word: String(w.word).slice(0, half), start: w.start, end: mid },
+      { word: String(w.word).slice(half), start: mid, end: w.end });
+    ed.selWord = i + 1;
+    paintEditorWords();
+  });
+  $("edMergeWord").addEventListener("click", () => {
+    const ed = state.editor;
+    const i = ed.selWord;
+    if (i == null || !ed.words[i] || !ed.words[i + 1]) { toast("Select a word that has a next word."); return; }
+    const a = ed.words[i], b = ed.words[i + 1];
+    ed.words.splice(i, 2, { word: (a.word + " " + b.word).trim(), start: a.start, end: b.end });
+    paintEditorWords();
+  });
+  $("edShiftWords").addEventListener("click", () => {
+    const ed = state.editor;
+    const d = parseFloat($("edShiftAmt").value) || 0;
+    if (!d) { toast("Type a shift amount in seconds first."); return; }
+    ed.words.forEach((w) => { w.start = Math.max(0, Number(w.start) + d); w.end = Math.max(0.05, Number(w.end) + d); });
+    paintEditorWords();
+    toast("All words shifted by " + d + "s — Save words, then Re-render.", true);
+  });
+  document.addEventListener("keydown", (e) => {
+    if ($("view-job").hidden || $("transcriptCard").hidden) return;
+    const tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (["INPUT", "TEXTAREA", "SELECT"].includes(tag)) return;
+    const hovered = document.querySelector(".transcript-line:hover");
+    if (e.key === " ") {
+      const v = document.querySelector("#clipGrid video");
+      if (v) { e.preventDefault(); v.paused ? v.play() : v.pause(); }
+    } else if ((e.key === "i" || e.key === "I") && hovered) {
+      $("manualStart").value = Number(hovered.dataset.start || 0).toFixed(1);
+    } else if ((e.key === "o" || e.key === "O") && hovered) {
+      $("manualEnd").value = Number(hovered.dataset.end || 0).toFixed(1);
+    }
+  });
+  $("reportBtn").addEventListener("click", () => {
+    const v = ($("sideStatus").textContent || "").split("·")[0].trim();
+    const body = encodeURIComponent("ClipForge " + v + "\n\nWhat happened:\n\nWhat I expected:\n\n(Attach diagnostics from Settings if you can.)");
+    $("reportBtn").href = "https://github.com/abh747393-creatord/ClipForge/issues/new?title=" +
+      encodeURIComponent("Bug report (" + v + ")") + "&body=" + body;
   });
 
   loadStatus().catch(() => {});

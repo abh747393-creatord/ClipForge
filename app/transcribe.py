@@ -95,12 +95,13 @@ def _collapse_repeats(words, limit=3):
     return out
 
 
-def transcribe_wav(wav_path, language=None, model=None):
+def transcribe_wav(wav_path, language=None, model=None, task="transcribe"):
     """Low-level helper: transcribe a 16 kHz mono WAV file.
 
     Returns (words, detected_language) with word times relative to the wav
     start. language="hinglish" transcribes as Hindi then transliterates to
-    Roman letters; language="hi" stays Devanagari. Raises on model failure.
+    Roman letters; language="hi" stays Devanagari. task="translate" renders
+    the speech as English (Whisper's translate task). Raises on model failure.
     """
     spec = model or config.ASR_MODEL
     m = _model_for(spec)
@@ -112,6 +113,7 @@ def transcribe_wav(wav_path, language=None, model=None):
     # ctranslate2 model can deadlock — never let two run at once.
     with _TRANSCRIBE_LOCK:
         segments, info = m.transcribe(audio, beam_size=5, language=whisper_lang,
+                                      task=task if task in ("transcribe", "translate") else "transcribe",
                                       initial_prompt=prompt, word_timestamps=True,
                                       vad_filter=True, condition_on_previous_text=False)
         words = []
@@ -126,12 +128,13 @@ def transcribe_wav(wav_path, language=None, model=None):
     return words, (info.language or whisper_lang or "")
 
 
-def transcribe(src, start, end, work_dir, language=None, model=None, report=lambda m: None) -> dict:
+def transcribe(src, start, end, work_dir, language=None, model=None, report=lambda m: None,
+               task="transcribe") -> dict:
     """Transcribe src[start:end] → {"words": [Word relative to start], "language": str, "model": str}.
 
     Extracts a 16 kHz WAV into work_dir (deleted after), runs faster-whisper,
     and caches the result as work_dir/<key>.words.json keyed by
-    (src stem, start, end, language, model); a cached result is returned
+    (src stem, start, end, language, model, task); a cached result is returned
     without re-running the model. Raises on extraction/model failure.
     """
     src = Path(src)
@@ -140,7 +143,8 @@ def transcribe(src, start, end, work_dir, language=None, model=None, report=lamb
     start, end = float(start), float(end)
     spec = model or config.ASR_MODEL
     model_tag = Path(str(spec)).name[:32]
-    raw_key = f"{src.stem}|{start:.2f}|{end:.2f}|{language or 'auto'}|{model_tag}"
+    task = task if task in ("transcribe", "translate") else "transcribe"
+    raw_key = f"{src.stem}|{start:.2f}|{end:.2f}|{language or 'auto'}|{model_tag}|{task}"
     key = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:16]
     cached = work_dir / f"{key}.words.json"
     if cached.is_file():
@@ -153,7 +157,7 @@ def transcribe(src, start, end, work_dir, language=None, model=None, report=lamb
     media.extract_audio(src, wav, start=start, end=end, sr=16000)
     try:
         report("Transcribing locally")
-        words, detected = transcribe_wav(wav, language=language, model=spec)
+        words, detected = transcribe_wav(wav, language=language, model=spec, task=task)
         dur = max(0.0, end - start)
         words = [dict(w, end=min(w["end"], dur)) for w in words if w["start"] < dur and w["end"] > w["start"]]
         result = {"words": words, "language": detected, "model": model_tag}
