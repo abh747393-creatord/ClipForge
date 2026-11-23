@@ -340,7 +340,8 @@ def render_clip(src, out_dir, name, clip, words_abs, src_w, src_h, options):
         # 5. Filtergraph: layout -> preset filter -> template/watermark ->
         #    PNG overlays -> campaign banner -> ASS burn (+ audio mix).
         parts = [layouts.render_graph(layout, (cam_px, game_px), top, width, height,
-                                      follow=follow_spec, src_h=src_h)]
+                                      cam_fx=str(options.get("cam_fx") or "unsharp=5:5:0.8:5:5:0.0"),
+                                      follow=follow_spec, src_w=src_w, src_h=src_h)]
         cur = "base"
         preset_filter = str(options.get("preset_filter") or "").strip()
         if preset_filter:

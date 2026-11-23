@@ -164,8 +164,28 @@ def _follow_graph(follow, width, height, src_h):
             f"scale={width}:{height}:flags=lanczos,setsar=1[base]")
 
 
+def _game_crop_x(w, h, src_w, src_h, cam_rect):
+    """Crop x (in scaled-frame pixels) for a full-frame game layer.
+
+    The game layer is scaled to cover (w, h), which usually leaves the
+    scaled frame wider than the panel. Centre the window on the action
+    (games put the player/crosshair mid-frame), slid just enough to keep
+    the facecam rect out of the shot so the webcam is not shown twice.
+    Hard-anchoring to an edge would throw the centre of the game away."""
+    scale = max(w / src_w, h / src_h)
+    sw = src_w * scale
+    x = (sw - w) / 2.0
+    cx, _cy, cw_px, _ch = cam_rect
+    cam_l, cam_r = cx * scale, (cx + cw_px) * scale
+    if (cam_l + cam_r) / 2.0 > sw / 2.0:      # cam on the right: slide left
+        x = min(x, cam_l - w)
+    else:                                       # cam on the left: slide right
+        x = max(x, cam_r)
+    return max(0.0, min(x, sw - w))
+
+
 def render_graph(name, rects_px, top=0.32, width=1080, height=1920, cam_fx='',
-                 follow=None, src_h=0):
+                 follow=None, src_h=0, src_w=0):
     """FFmpeg filtergraph from [0:v] to [base] for one layout.
 
     rects_px is (cam_rect, game_rect), each (x, y, w, h) in SOURCE pixels or
@@ -173,6 +193,8 @@ def render_graph(name, rects_px, top=0.32, width=1080, height=1920, cam_fx='',
     cam_fx is an extra filter string appended after the cam layer's scale
     (e.g. "eq=contrast=1.05,unsharp=5:5:0.5"; a leading comma is optional).
     follow: (keys, crop_w) for the follow layout (facecam.follow_keys).
+    src_w/src_h: source size, used to place the gameplay window (centre
+    on the action, slid just enough to keep the facecam out of shot).
     """
     spec = geometry(name, top, width, height)
     rects_px = rects_px or (None, None)
@@ -227,14 +249,16 @@ def render_graph(name, rects_px, top=0.32, width=1080, height=1920, cam_fx='',
                 crop = f'crop={w}:{h}:{x}:{y},'
         w, h = layer['w'], layer['h']
         anchor = layer.get('anchor')
-        # Gameplay slides away from the facecam (stream-clips stack_graph):
-        # with a full-frame game layer and a known cam rect, anchor the crop
-        # to the side opposite the cam so the webcam isn't shown twice.
-        if anchor is None and layer['source'] == 'game' and rects_px[1] is None and rects_px[0] is not None:
-            cx, _cy, cw_px, _ch = rects_px[0]
-            # cam on the right (x > its own width) -> keep the left of the game, and vice versa
-            anchor = 'left' if cx > cw_px else 'right'
-        if anchor == 'left':
+        # Gameplay window: centre on the action, slid just enough to keep
+        # the facecam out of the shot (so the webcam isn't shown twice).
+        # Hard-anchoring to an edge throws the centre of the game away.
+        game_x = None
+        if (anchor is None and layer['source'] == 'game' and rects_px[1] is None
+                and rects_px[0] is not None and src_w and src_h):
+            game_x = _game_crop_x(w, h, src_w, src_h, rects_px[0])
+        if game_x is not None:
+            fit_crop = f"crop={w}:{h}:x='min(max({game_x:.0f},0),in_w-out_w)':y=0"
+        elif anchor == 'left':
             fit_crop = f'crop={w}:{h}:0:0'
         elif anchor == 'right':
             fit_crop = f'crop={w}:{h}:in_w-out_w:0'

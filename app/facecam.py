@@ -266,32 +266,49 @@ def cam_box_from_face(frames, face):
         persist += cv2.Canny(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), 60, 150) > 0
     persist /= max(1, n)
     persist = cv2.dilate(persist, np.ones((3, 3), np.uint8))
-    xs = slice(int(max(0, fx - fw)), int(min(W, fx + 2 * fw)))
+    xs = slice(int(max(0, fx - 0.5 * fw)), int(min(W, fx + 1.5 * fw)))
     ys = slice(int(max(0, fy - 0.5 * fh)), int(min(H, fy + 2 * fh)))
     rows = persist[:, xs].mean(axis=1)
     cols = persist[ys, :].mean(axis=0)
 
-    def strongest(scores, a, b, edge):
+    def strongest(scores, a, b, edge, outer='min'):
+        """The overlay border on one side: the OUTERMOST persistent edge.
+
+        The single strongest edge is often an inner line (a chair back, a
+        banner inside the webcam picture); the overlay's own border is the
+        outermost strong line. Take the farthest position scoring at least
+        80% of the range's peak (and at least 0.5 persistence)."""
         a, b = int(max(0, a)), int(min(len(scores), b))
         if b - a < 2:
             return edge
         seg = scores[a:b]
-        k = int(np.argmax(seg))
-        return a + k if seg[k] >= 0.6 else edge
+        peak = float(seg.max())
+        if peak < 0.5:
+            return edge
+        idx = np.where(seg >= max(0.5, 0.8 * peak))[0]
+        k = int(idx[0] if outer == 'min' else idx[-1])
+        return a + k
 
-    top = strongest(rows, fy - 4.0 * fh, fy - 0.3 * fh, 0 if fy - 4.0 * fh <= 0 else None)
-    bottom = strongest(rows, fy + 1.4 * fh, fy + 5.0 * fh, H if fy + 5.0 * fh >= H else None)
-    left = strongest(cols, fx - 6.0 * fw, fx - 0.3 * fw, 0 if fx - 6.0 * fw <= 0 else None)
-    right = strongest(cols, fx + 1.3 * fw, fx + 7.0 * fw, W if fx + 7.0 * fw >= W else None)
+    top = strongest(rows, fy - 4.0 * fh, fy - 0.15 * fh, 0 if fy - 4.0 * fh <= 0 else None, 'min')
+    bottom = strongest(rows, fy + 1.4 * fh, fy + 5.0 * fh, H if fy + 5.0 * fh >= H else None, 'max')
+    left = strongest(cols, fx - 6.0 * fw, fx - 0.15 * fw, 0 if fx - 6.0 * fw <= 0 else None, 'min')
+    right = strongest(cols, fx + 1.15 * fw, fx + 7.0 * fw, W if fx + 7.0 * fw >= W else None, 'max')
     if None not in (top, bottom, left, right):
         bw, bh = right - left, bottom - top
-        if (2.0 * fw <= bw <= 10 * fw and 1.8 * fh <= bh <= 7 * fh and bw <= 0.65 * W
+        # Lower bound is loose (1.2x): with several faces side by side the
+        # face union already spans most of the webcam's width.
+        if (1.2 * fw <= bw <= 10 * fw and 1.8 * fh <= bh <= 7 * fh and bw <= 0.65 * W
                 and bh <= 0.75 * H and 0.6 <= bw / bh <= 2.6):
             return (float(left), float(top), float(bw), float(bh)), "overlay edges"
-    bw = min(4.5 * fw, 0.6 * W)
-    bh = min(bw * 0.75, 0.7 * H)
-    x0 = min(max(fx + fw / 2 - bw / 2, 0), W - bw)
-    y0 = min(max(fy + fh / 2 - 0.42 * bh, 0), H - bh)
+    # No clean border found: size a box from the faces with head-height
+    # margins (shoulders extend ~2 head heights past the outermost face,
+    # the box top sits ~1 head height above the faces).
+    bw = min(fw + 4.4 * fh, 0.62 * W)
+    bh = min(4.8 * fh, 0.72 * H)
+    x0 = max(fx - 2.2 * fh, 0)
+    y0 = max(fy - 1.1 * fh, 0)
+    bw = min(bw, W - x0)
+    bh = min(bh, H - y0)
     return (x0, y0, bw, bh), "face size"
 
 
@@ -325,7 +342,21 @@ def auto_look(src, start, length, src_w, src_h, forced_cam=None):
                 out["why"] = "several faces, probably thumbnails"
                 return out
             t = small[0]
-            box, how = cam_box_from_face(frames, t["box"])
+            # Box the whole face cluster, not just the main face: a wide
+            # two-person webcam has its border far from any single face,
+            # and boxing one face alone finds an inner edge instead — a
+            # tight sub-crop that then gets upscaled several times over.
+            fh_s, fw_s = frames.shape[1], frames.shape[2]
+            cx0 = t["box"][0] + t["box"][2] / 2
+            cy0 = t["box"][1] + t["box"][3] / 2
+            group = [s for s in small
+                     if abs(s["box"][0] + s["box"][2] / 2 - cx0) <= 0.30 * fw_s
+                     and abs(s["box"][1] + s["box"][3] / 2 - cy0) <= 0.30 * fh_s]
+            ux = min(s["box"][0] for s in group)
+            uy = min(s["box"][1] for s in group)
+            ux1 = max(s["box"][0] + s["box"][2] for s in group)
+            uy1 = max(s["box"][1] + s["box"][3] for s in group)
+            box, how = cam_box_from_face(frames, (ux, uy, ux1 - ux, uy1 - uy))
             cam = {"x": round(box[0] * scale / src_w, 4), "y": round(box[1] * scale / src_h, 4),
                    "w": round(box[2] * scale / src_w, 4), "h": round(box[3] * scale / src_h, 4)}
             out.update(layout="stack", cam=cam, track=t, why=f"facecam found by {how}")
