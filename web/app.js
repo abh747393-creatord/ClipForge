@@ -348,11 +348,14 @@ function setUploadFile(f) {
 
 /* The real frame loads after the metadata (it is a stream fetch and can
    be slow) and swaps in over the thumbnail when it arrives. */
-async function loadPreviewFrame(url, img) {
+async function loadPreviewFrame(url, img, infoEl) {
   try {
     const r = await postJSON("/api/preview-frame", { url: url });
     if (r.frame) { img.src = r.frame; img.hidden = false; }
-  } catch (e) { /* the thumbnail stays */ }
+  } catch (e) {
+    /* thumbnail stays, but SAY why the real frame failed */
+    if (infoEl) infoEl.textContent += " · frame failed: " + e.message;
+  }
 }
 
 /* Link preview: title/duration + a REAL frame from the video (the
@@ -377,7 +380,7 @@ async function previewLink() {
     const src = p.frame || p.thumbnail;
     if (src) { img.src = src; img.hidden = false; }
     else { img.hidden = true; }
-    loadPreviewFrame(url, img);
+    loadPreviewFrame(url, img, $("linkInfo"));
   } catch (e) {
     $("linkInfo").textContent = "preview failed — " + e.message + " (you can still make clips)";
   }
@@ -411,7 +414,7 @@ async function previewLive() {
     if (src) { img.src = src; img.hidden = false; }
     else { img.hidden = true; }
     syncLiveBoxes();
-    loadPreviewFrame(url, img);
+    loadPreviewFrame(url, img, $("liveInfo"));
   } catch (e) {
     $("liveInfo").textContent = "preview failed — " + e.message + " (you can still start live clipping)";
   }
