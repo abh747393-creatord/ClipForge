@@ -6,22 +6,63 @@ echo ============================================
 echo   ClipForge update ho raha hai...
 echo ============================================
 
+:: Abhi wala version dikhao
+set OLDVER=unknown
+for /f "tokens=3 delims= " %%v in ('findstr /c:"VERSION =" app\server.py 2^>nul') do set OLDVER=%%~v
+echo Abhi installed version: %OLDVER%
+
 :: Purani chalti hui ClipForge band karo (port 8780 par jo bhi ho)
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8780 ^| findstr LISTENING') do taskkill /PID %%a /F >nul 2>&1
+timeout /t 2 /nobreak >nul
 
-:: Latest version GitHub se download karo
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -Uri 'https://github.com/abh747393-creatord/ClipForge/archive/refs/heads/main.zip' -OutFile '%TEMP%\clipforge-update.zip' -UseBasicParsing } catch { exit 1 }"
-if errorlevel 1 (
-    echo Internet nahi mila - purana version hi chala rahi hun.
-    goto :start_app
-)
-
-:: Extract karke isi folder par copy karo (.venv aur data ko haath nahi lagana)
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '%TEMP%\clipforge-update.zip' -DestinationPath '%TEMP%\clipforge-update' -Force"
-robocopy "%TEMP%\clipforge-update\ClipForge-main" "%~dp0" /E /XD .venv data /XF "Update-ClipForge.bat" >nul
+:: Purani temp files saaf karo, phir latest version download karo
 del "%TEMP%\clipforge-update.zip" >nul 2>&1
 rmdir /s /q "%TEMP%\clipforge-update" >nul 2>&1
-echo Update ho gaya!
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -Uri 'https://github.com/abh747393-creatord/ClipForge/archive/refs/heads/main.zip' -OutFile '%TEMP%\clipforge-update.zip' -UseBasicParsing } catch { exit 1 }"
+if errorlevel 1 goto :dlfail
+if not exist "%TEMP%\clipforge-update.zip" goto :dlfail
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '%TEMP%\clipforge-update.zip' -DestinationPath '%TEMP%\clipforge-update' -Force"
+if not exist "%TEMP%\clipforge-update\ClipForge-main\app\server.py" goto :dlfail
+
+:: Download mein konsa version aaya hai, check karo
+set NEWVER=unknown
+for /f "tokens=3 delims= " %%v in ('findstr /c:"VERSION =" "%TEMP%\clipforge-update\ClipForge-main\app\server.py"') do set NEWVER=%%~v
+echo Download mein version: %NEWVER%
+
+:: Isi folder par copy karo (.venv aur data ko haath nahi lagana)
+robocopy "%TEMP%\clipforge-update\ClipForge-main" "%~dp0" /E /XD .venv data __pycache__ /XF "Update-ClipForge.bat" > "%TEMP%\clipforge-copy.log"
+if errorlevel 8 goto :copyfail
+
+:: Purana bytecode saaf karo taake purana code na chale
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -Path '%~dp0app' -Recurse -Directory -Filter __pycache__ -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"
+
+del "%TEMP%\clipforge-update.zip" >nul 2>&1
+rmdir /s /q "%TEMP%\clipforge-update" >nul 2>&1
+
+:: Verify: folder mein ab naya version hai?
+set NOWVER=unknown
+for /f "tokens=3 delims= " %%v in ('findstr /c:"VERSION =" app\server.py 2^>nul') do set NOWVER=%%~v
+echo Update ke baad version: %NOWVER%
+if not "%NOWVER%"=="%NEWVER%" goto :copyfail
+echo Update pakka ho gaya! Version %NOWVER%
+goto :start_app
+
+:dlfail
+echo ============================================
+echo   DOWNLOAD FAIL ho gaya - internet check karo.
+echo   Purana version %OLDVER% hi chala rahi hun.
+echo ============================================
+goto :start_app
+
+:copyfail
+echo ============================================
+echo   COPY FAIL ho gaya - files replace nahi huin!
+echo   ClipForge ki saari windows band karke ye file
+echo   dobara chalao. Log: %TEMP%\clipforge-copy.log
+echo ============================================
+pause
+goto :start_app
 
 :start_app
 :: Pehli dafa ho to venv banao, warna requirements check kar lo

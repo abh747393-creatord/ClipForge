@@ -19,7 +19,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import assets, brain, captions, config, facecam, jobs, layouts, live, llm, media, presets, preview, publish
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 UPLOAD_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 STATIC_FILES = {"style.css", "app.js"}
 
