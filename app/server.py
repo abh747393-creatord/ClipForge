@@ -6,6 +6,7 @@ config.llm_settings() reads them. The API key is never returned by the API.
 """
 import json
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -26,6 +27,10 @@ config.ensure_dirs()
 store = jobs.JobStore()
 store.load_existing()
 live.start_watcher(store)
+
+# Last resolved preview metadata per URL (lets /api/preview-frame reuse
+# the formats from /api/preview instead of resolving the link twice).
+_preview_cache: dict = {}
 
 app = FastAPI(title="ClipForge")
 
@@ -397,10 +402,9 @@ async def export_zip(job_id: str):
 @app.post("/api/preview")
 async def link_preview(payload: dict):
     """Link preview before a job starts (PeakCut /api/preview): title,
-    uploader, duration, thumbnail, is-live — no download. Also grabs one
-    REAL frame from the video (data URI in "frame") so the facecam /
-    gameplay sections can be drag-selected on the actual layout; the
-    thumbnail stays as the fallback when the grab fails."""
+    uploader, duration, thumbnail, is-live — no download. Returns fast;
+    the REAL frame (for facecam/gameplay box selection) comes from
+    /api/preview-frame, which the UI loads right after and swaps in."""
     url = (payload.get("url") or "").strip()
     if not url or not media.site_allowed(url):
         raise HTTPException(400, "That link is not supported.")
@@ -408,20 +412,39 @@ async def link_preview(payload: dict):
         m = media.info(url)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, media.friendly_error(e, url)) from e
+    _preview_cache[url] = (time.time(), m)
     raw = m.get("raw") or {}
-    frame = ""
+    return {"title": m.get("title") or "", "uploader": m.get("uploader") or "",
+            "duration": m.get("duration") or 0, "is_live": bool(m.get("is_live")),
+            "width": m.get("width") or 0, "height": m.get("height") or 0,
+            "thumbnail": raw.get("thumbnail") or "", "frame": ""}
+
+
+@app.post("/api/preview-frame")
+async def link_preview_frame(payload: dict):
+    """One REAL frame from the video (data URI), for drag-selecting the
+    facecam/gameplay sections on the actual layout. Separate from
+    /api/preview so the metadata shows immediately while the frame
+    (a stream fetch, slow on some connections) loads after."""
+    url = (payload.get("url") or "").strip()
+    if not url or not media.site_allowed(url):
+        raise HTTPException(400, "That link is not supported.")
+    cached = _preview_cache.get(url)
+    m = cached[1] if cached and time.time() - cached[0] < 300 else None
+    if m is None:
+        try:
+            m = media.info(url)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, media.friendly_error(e, url)) from e
     try:
         import base64
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             fp = media.preview_frame(url, Path(td) / "frame.jpg", meta=m)
             frame = "data:image/jpeg;base64," + base64.b64encode(fp.read_bytes()).decode()
-    except Exception:  # noqa: BLE001 - preview still works with the thumbnail
-        frame = ""
-    return {"title": m.get("title") or "", "uploader": m.get("uploader") or "",
-            "duration": m.get("duration") or 0, "is_live": bool(m.get("is_live")),
-            "width": m.get("width") or 0, "height": m.get("height") or 0,
-            "thumbnail": raw.get("thumbnail") or "", "frame": frame}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, media.friendly_error(e, url)) from e
+    return {"frame": frame}
 
 
 @app.get("/api/readiness")
