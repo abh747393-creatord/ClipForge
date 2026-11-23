@@ -9,6 +9,7 @@ const state = {
   currentJobId: null, currentJob: null,
   regions: { facecam: null, game: null },
   newRegions: { facecam: null, game: null },
+  liveRegions: { facecam: null, game: null },
   editor: { jobId: null, idx: -1, clip: null, regions: { facecam: null, game: null }, words: [], previewTimer: null, previewSeq: 0, previewUrl: null },
   logoPath: null, musicPath: null,
   liveId: null,
@@ -168,6 +169,8 @@ function liveOptions() {
   const o = collectOptions();
   o.layout = $("liveLayout").value || o.layout;
   o.style = $("liveStyle").value || o.style;
+  if (state.liveRegions.facecam) o.facecam = state.liveRegions.facecam;
+  if (state.liveRegions.game) o.game = state.liveRegions.game;
   o.ai_every_min = parseInt($("liveEvery").value, 10) || 3;
   o.live_judge = $("liveJudge").checked;
   o.live_min_score = parseFloat($("liveMinScore").value) || 6;
@@ -343,6 +346,15 @@ function setUploadFile(f) {
   if (f) grabUploadFrame(f);
 }
 
+/* The real frame loads after the metadata (it is a stream fetch and can
+   be slow) and swaps in over the thumbnail when it arrives. */
+async function loadPreviewFrame(url, img) {
+  try {
+    const r = await postJSON("/api/preview-frame", { url: url });
+    if (r.frame) { img.src = r.frame; img.hidden = false; }
+  } catch (e) { /* the thumbnail stays */ }
+}
+
 /* Link preview: title/duration + a REAL frame from the video (the
    thumbnail is only a fallback) so the facecam & gameplay sections can
    be drag-selected on the actual layout BEFORE making clips. */
@@ -365,8 +377,43 @@ async function previewLink() {
     const src = p.frame || p.thumbnail;
     if (src) { img.src = src; img.hidden = false; }
     else { img.hidden = true; }
+    loadPreviewFrame(url, img);
   } catch (e) {
     $("linkInfo").textContent = "preview failed — " + e.message + " (you can still make clips)";
+  }
+  btn.disabled = false;
+}
+
+/* Live preview: same real-frame preview + facecam/gameplay boxes as the
+   New Job tab, so live clips use the sections picked here. */
+function syncLiveBoxes() {
+  const layout = $("liveLayout").value || state.layout;
+  placeBox($("boxLiveFacecam"), needsCam(layout) ? state.liveRegions.facecam : null);
+  placeBox($("boxLiveGame"), needsGame(layout) ? state.liveRegions.game : null);
+}
+async function previewLive() {
+  const url = $("liveUrl").value.trim();
+  if (!url) { toast("Paste a live stream link first."); return; }
+  const btn = $("livePreviewBtn");
+  btn.disabled = true;
+  $("liveInfo").textContent = "fetching preview…";
+  $("livePreviewCard").hidden = false;
+  try {
+    const p = await postJSON("/api/preview", { url: url });
+    const bits = [];
+    if (p.title) bits.push(p.title);
+    if (p.uploader) bits.push(p.uploader);
+    if (p.is_live) bits.push("🔴 LIVE");
+    else if (p.duration) bits.push(fmtTime(p.duration));
+    $("liveInfo").textContent = bits.join(" · ") || "preview ready";
+    const img = $("liveThumb");
+    const src = p.frame || p.thumbnail;
+    if (src) { img.src = src; img.hidden = false; }
+    else { img.hidden = true; }
+    syncLiveBoxes();
+    loadPreviewFrame(url, img);
+  } catch (e) {
+    $("liveInfo").textContent = "preview failed — " + e.message + " (you can still start live clipping)";
   }
   btn.disabled = false;
 }
@@ -1326,6 +1373,21 @@ document.addEventListener("DOMContentLoaded", () => {
     state.newRegions.game = { x: 0, y: 0, w: 1, h: 1 };
     placeBox($("boxNewGame"), state.newRegions.game);
   });
+
+  /* ---- live: preview + regions ---- */
+  $("livePreviewBtn").addEventListener("click", previewLive);
+  makeDraggable($("boxLiveFacecam"), "facecam", "liveRegionWrap", state.liveRegions);
+  makeDraggable($("boxLiveGame"), "game", "liveRegionWrap", state.liveRegions);
+  document.querySelectorAll("[data-lpreset]").forEach((b) => b.addEventListener("click", () => {
+    const p = b.dataset.lpreset;
+    state.liveRegions.facecam = p === "none" ? null : Object.assign({}, PRESETS[p]);
+    syncLiveBoxes();
+  }));
+  $("liveGameFullBtn").addEventListener("click", () => {
+    state.liveRegions.game = { x: 0, y: 0, w: 1, h: 1 };
+    syncLiveBoxes();
+  });
+  $("liveLayout").addEventListener("change", syncLiveBoxes);
 
   /* ---- new: custom caption look ---- */
   $("capCustomOn").addEventListener("change", () => {
