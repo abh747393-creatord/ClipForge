@@ -454,6 +454,46 @@ def _hls_frame(playlist_url, out_jpg, width=960) -> Path:
     return Path(out_jpg)
 
 
+def _dash_segments_frame(fmt, out_jpg, width=960, live=False) -> Path:
+    """One frame from a YouTube http_dash_segments format (live/post-live
+    broadcasts): fetch the init segment (sq=0) + one media segment and
+    decode locally, like _hls_frame. Plain ffmpeg on the base URL fails
+    with Input/output error — these URLs serve a single segment per sq=
+    request and do not support byte-range seeking."""
+    import re
+    base, count = None, 0
+    for fr in fmt.get("fragments") or []:
+        u = fr.get("url") or ""
+        if not u and fr.get("path"):
+            u = (fmt.get("fragment_base_url") or "") + fr["path"]
+        if re.search(r"sq[=/]\d+", u):
+            base = u
+            count = int(fr.get("fragment_count") or 0)
+            break
+    if not base:
+        raise RuntimeError("No sq= fragment URL in DASH format.")
+    sep = "=" if "sq=" in base else "/"
+    if live:
+        seg_no = max(1, count - 2) if count else 1
+    else:
+        seg_no = max(1, int(count * 0.1)) if count else 10
+    proxy = _proxy_url()
+    init_url = re.sub(r"sq[=/]\d+", f"sq{sep}0", base)
+    seg_url = re.sub(r"sq[=/]\d+", f"sq{sep}{seg_no}", base)
+    data = _fetch_bytes(init_url, proxy) + _fetch_bytes(seg_url, proxy)
+    seg = Path(out_jpg).with_suffix(".seg.mp4")
+    seg.parent.mkdir(parents=True, exist_ok=True)
+    seg.write_bytes(data)
+    try:
+        p = run(["ffmpeg", "-y", "-v", "error", "-i", str(seg), "-frames:v", "1",
+                 "-vf", f"scale={int(width)}:-2", "-q:v", "3", str(out_jpg)], timeout=60)
+        if p.returncode != 0 or not Path(out_jpg).is_file():
+            raise RuntimeError(f"DASH segment frame decode failed: {(p.stderr or '')[-300:]}")
+    finally:
+        seg.unlink(missing_ok=True)
+    return Path(out_jpg)
+
+
 def preview_frame(url, out_jpg, meta=None, width=960) -> Path:
     """A REAL frame from the video at `url` (not the thumbnail), so the user
     can drag-select the facecam/gameplay sections on the actual layout.
@@ -514,6 +554,15 @@ def preview_frame(url, out_jpg, meta=None, width=960) -> Path:
     if "m3u8" in proto or ".m3u8" in stream_url or "/manifest/" in stream_url:
         try:
             return _hls_frame(stream_url, out_jpg, width=width)
+        except Exception:
+            pass  # fall through to the ffmpeg grab below
+
+    # YouTube live/post-live broadcasts serve http_dash_segments formats:
+    # one segment per sq= request. Fetch init + one segment directly —
+    # ffmpeg on the base URL dies with Input/output error.
+    if "dash_segments" in proto or fmt.get("fragments"):
+        try:
+            return _dash_segments_frame(fmt, out_jpg, width=width, live=is_live)
         except Exception:
             pass  # fall through to the ffmpeg grab below
 
@@ -709,7 +758,8 @@ def watchlist_newest(platform, handle, words=None, max_age_h=48):
 
 def resolve_live(url, height=1080) -> dict:
     """Direct stream URLs for a live link: {"urls": [...], "title": str}.
-    Raises ValueError("not live") if the link is not currently live.
+    Raises ValueError with a user-facing message if the link is not
+    currently live.
     `height` caps the recorded quality (the streamer's own top quality
     up to that cap) — facecam crops upscale badly from low-res sources,
     so live recording defaults to 1080p."""
@@ -722,7 +772,8 @@ def resolve_live(url, height=1080) -> dict:
 
     i = _with_ladder(fetch)
     if not i.get("is_live"):
-        raise ValueError("not live")
+        raise ValueError("This stream is not live right now — it has ended or "
+                         "not started yet. To clip the recording, use the New Job tab.")
     urls = []
     height = int(i.get("height") or 0)
     if i.get("url"):
