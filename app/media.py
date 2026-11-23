@@ -5,6 +5,7 @@ format strings and bot-check retry ladder (both MIT). No soundfile
 dependency: WAV loading uses the stdlib wave module.
 """
 import json
+import os
 import re
 import subprocess
 import wave
@@ -22,6 +23,11 @@ ALLOWED_HOSTS = {
 }
 
 _BOT_CHECK = re.compile(r"not a bot|confirm you.?re not|sign in to confirm(?! your age)|http error 403|http error 429|too many requests", re.I)
+
+# Errors where another route (player client / proxy / cookies) may succeed.
+_RETRYABLE = re.compile(
+    r"not a bot|confirm you.?re not|sign in|confirm your age|age-restricted|"
+    r"no video formats|login required|http error 403|http error 429|too many requests", re.I)
 
 
 def run(cmd, **kw):
@@ -70,18 +76,71 @@ def _video_format(height):
 
 
 def _is_blocked(err) -> bool:
-    return bool(_BOT_CHECK.search(str(err)))
+    return bool(_RETRYABLE.search(str(err)))
+
+
+def _proxy_url():
+    """Optional HTTP proxy for yt-dlp (env CLIPFORGE_PROXY). On servers whose
+    IP YouTube refuses (datacenter ranges), routing through a proxy on a
+    normal connection is often the only way formats come back."""
+    url = (os.environ.get("CLIPFORGE_PROXY") or "").strip()
+    return url or None
+
+
+def _cookie_browser():
+    """yt-dlp cookiesfrombrowser tuple for a signed-in local browser, or None.
+
+    Env CLIPFORGE_COOKIES_BROWSER overrides ("chromium", "chrome", "firefox",
+    "none" to disable). Otherwise auto-detects Chromium/Chrome profiles
+    (incl. the snap Chromium profile). Used as a last ladder rung — it
+    unlocks age-restricted videos on a home connection. Never combined with
+    the proxy (proven to break format listing)."""
+    override = (os.environ.get("CLIPFORGE_COOKIES_BROWSER") or "").strip().lower()
+    if override == "none":
+        return None
+    if override:
+        return (override,)
+    home = Path.home()
+    candidates = [
+        ("chromium", home / "snap/chromium/common/chromium/Default"),
+        ("chromium", home / ".config/chromium/Default"),
+        ("chrome", home / ".config/google-chrome/Default"),
+        ("chromium", home / ".config/chromium"),
+        ("chrome", home / ".config/google-chrome"),
+    ]
+    for name, profile in candidates:
+        if (profile / "Cookies").is_file() or (profile / "Network/Cookies").is_file():
+            return (name, str(profile))
+    return None
+
+
+def _ladder_attempts():
+    """Extra yt-dlp opts per attempt, best route first. A configured proxy
+    goes first (on a blocked-IP server it is the only route that works);
+    browser cookies go last (age-restricted unlock on home connections)."""
+    attempts = []
+    proxy = _proxy_url()
+    if proxy:
+        attempts.append({"proxy": proxy, "nocheckcertificate": True})
+    attempts.append({})
+    attempts.append({"extractor_args": {"youtube": {"player_client": ["tv", "web_safari"]}}})
+    attempts.append({"extractor_args": {"youtube": {"player_client": ["ios"]}}})
+    cfb = _cookie_browser()
+    if cfb:
+        attempts.append({"cookiesfrombrowser": cfb})
+    return attempts
 
 
 def _with_ladder(fn):
-    """Run fn(ydl) through the bot-check retry ladder: default settings, then
-    YouTube player clients tv+web_safari, then ios. Non-block errors on the
-    default attempt propagate immediately."""
-    attempts = [None, ["tv", "web_safari"], ["ios"]]
+    """Run fn(extra_opts) through the retry ladder: configured proxy (if
+    any), default settings, YouTube player clients tv+web_safari, ios, then
+    signed-in browser cookies (if a profile was found). Non-retryable
+    errors on the first attempt propagate immediately."""
+    attempts = _ladder_attempts()
     last = None
-    for i, clients in enumerate(attempts):
+    for i, extra in enumerate(attempts):
         try:
-            return fn(clients)
+            return fn(extra)
         except Exception as e:  # noqa: BLE001 - yt-dlp raises several error types
             last = e
             if _is_blocked(e) or i > 0:
@@ -101,10 +160,11 @@ def _newest(dest_dir: Path, stem: str = None) -> Path:
 def info(url) -> dict:
     """Metadata without downloading: {"title","uploader","duration","is_live","width","height","raw"}.
     Raises whatever yt-dlp raises on an unreadable link."""
-    def fetch(clients):
-        opts = {}
-        if clients:
-            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+    def fetch(extra):
+        # Metadata must come back even when YouTube serves no formats to
+        # this connection (live streams on blocked IPs) — preview uses it.
+        opts = {"ignore_no_formats_error": True}
+        opts.update(extra)
         with _ydl(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
@@ -169,11 +229,10 @@ def download(url, dest_dir, height=1080, progress_cb=None) -> Path:
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    def fetch(clients):
+    def fetch(extra):
         opts = {"format": _video_format(height), "merge_output_format": "mp4",
                 "outtmpl": str(dest_dir / "source.%(ext)s"), "progress_hooks": [_progress_hook(progress_cb)]}
-        if clients:
-            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        opts.update(extra)
         with _ydl(opts) as ydl:
             ydl.download([url])
 
@@ -186,11 +245,10 @@ def download_audio(url, dest_dir, progress_cb=None) -> Path:
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    def fetch(clients):
+    def fetch(extra):
         opts = {"format": "ba[ext=m4a]/ba/worst", "outtmpl": str(dest_dir / "audio_src.%(ext)s"),
                 "progress_hooks": [_progress_hook(progress_cb)]}
-        if clients:
-            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        opts.update(extra)
         with _ydl(opts) as ydl:
             ydl.download([url])
 
@@ -205,13 +263,12 @@ def download_section(url, dest_dir, start, end, height=1080) -> Path:
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    def fetch(clients):
+    def fetch(extra):
         opts = {"format": _video_format(height), "merge_output_format": "mp4",
                 "outtmpl": str(dest_dir / "section.%(ext)s"),
                 "download_ranges": download_range_func(None, [(max(0.0, float(start)), float(end))]),
                 "force_keyframes_at_cuts": False}
-        if clients:
-            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        opts.update(extra)
         with _ydl(opts) as ydl:
             ydl.download([url])
 
@@ -324,17 +381,21 @@ def friendly_error(exc, url="") -> str:
     Ported from stream-clips media.friendly()."""
     text = str(exc)
     low = text.lower()
-    if "confirm your age" in low or "sign in to confirm" in low or "age-restricted" in low:
+    if "not a bot" in low or ("sign in to confirm" in low and "your age" not in low):
+        return ("YouTube is asking to confirm you're not a bot. Wait a while, or download the "
+                "video in your browser and upload the file here.")
+    if "confirm your age" in low or "age-restricted" in low or "age restricted" in low:
         return ("YouTube needs a login for this video (age-restricted). "
                 "Download it in your browser while signed in, then upload the file here.")
+    if "no video formats" in low:
+        return ("YouTube isn't serving this video to this connection (common on servers and "
+                "VPNs, especially for live streams). Download it in your browser, then upload "
+                "the file here.")
     if "kick" in str(url) and ("403" in text or "forbidden" in low):
         return "Kick blocked the download. Download it in your browser, then upload the file here."
     if "subscriber" in low or "sub-only" in low or "only available to" in low:
         return ("This VOD is subscriber-only. Download it from an account that can watch it, "
                 "then upload the file here.")
-    if "not a bot" in low:
-        return ("YouTube is asking to confirm you're not a bot. Wait a while, or download the "
-                "video in your browser and upload the file here.")
     return text
 
 
@@ -360,11 +421,10 @@ def chat_speed(url, meta=None, work_dir=None):
             except (OSError, ValueError):
                 pass
 
-        def fetch(clients):
+        def fetch(extra):
             opts = {"skip_download": True, "writesubtitles": True, "subtitleslangs": ["live_chat"],
                     "outtmpl": str(work / "chat.%(ext)s")}
-            if clients:
-                opts["extractor_args"] = {"youtube": {"player_client": clients}}
+            opts.update(extra)
             with _ydl(opts) as ydl:
                 ydl.download([url])
 
@@ -415,10 +475,9 @@ def _search_filter(when):
 def _flat_listing(url, limit=20):
     """yt-dlp flat-playlist entries for a search/channel page (fail-soft [])."""
     try:
-        def fetch(clients):
+        def fetch(extra):
             opts = {"extract_flat": True, "playlistend": int(limit)}
-            if clients:
-                opts["extractor_args"] = {"youtube": {"player_client": clients}}
+            opts.update(extra)
             with _ydl(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         data = _with_ladder(fetch)
@@ -492,10 +551,9 @@ def watchlist_newest(platform, handle, words=None, max_age_h=48):
 def resolve_live(url) -> dict:
     """Direct stream URLs for a live link: {"urls": [...], "title": str}.
     Raises ValueError("not live") if the link is not currently live."""
-    def fetch(clients):
+    def fetch(extra):
         opts = {"format": "b[height<=720]/bv*[height<=720]+ba/b"}
-        if clients:
-            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        opts.update(extra)
         with _ydl(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
