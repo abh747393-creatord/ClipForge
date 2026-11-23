@@ -548,7 +548,31 @@
     <section class="view" id="view-live" hidden>
       <div class="card">
         <label class="field-label" for="liveUrl">Live stream link (Twitch / YouTube Live / Kick)</label>
-        <input id="liveUrl" type="url" placeholder="https://www.twitch.tv/channel" autocomplete="off">
+        <div class="row">
+          <input id="liveUrl" type="url" placeholder="https://www.twitch.tv/channel" autocomplete="off" style="flex:1">
+          <button class="btn" id="livePreviewBtn" type="button">👁 Preview</button>
+        </div>
+        <div id="livePreviewCard" hidden>
+          <div class="hint" id="liveInfo"></div>
+          <div class="region-wrap" id="liveRegionWrap">
+            <img id="liveThumb" alt="live preview frame">
+            <div class="region-box facecam" id="boxLiveFacecam" hidden>
+              <span class="region-tag">Facecam</span><i class="handle"></i>
+            </div>
+            <div class="region-box game" id="boxLiveGame" hidden>
+              <span class="region-tag">Gameplay</span><i class="handle"></i>
+            </div>
+          </div>
+          <div class="row wrap">
+            <button class="btn sm" data-lpreset="tl" type="button">Facecam TL</button>
+            <button class="btn sm" data-lpreset="tr" type="button">TR</button>
+            <button class="btn sm" data-lpreset="bl" type="button">BL</button>
+            <button class="btn sm" data-lpreset="br" type="button">BR</button>
+            <button class="btn sm" data-lpreset="none" type="button">None (auto)</button>
+            <button class="btn sm" id="liveGameFullBtn" type="button">Gameplay = full frame</button>
+          </div>
+          <div class="hint">Drag the boxes to select the <b>facecam section</b> and the <b>gameplay section</b> yourself — they are used for every live clip. Leave them off for auto-detection.</div>
+        </div>
         <div class="grid3">
           <label>Layout <select id="liveLayout"></select></label>
           <label>Caption style <select id="liveStyle"></select></label>
