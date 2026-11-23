@@ -343,8 +343,9 @@ function setUploadFile(f) {
   if (f) grabUploadFrame(f);
 }
 
-/* Link preview: title/duration/thumbnail + drag-select the facecam &
-   gameplay sections BEFORE making clips (NeonClipping-style). */
+/* Link preview: title/duration + a REAL frame from the video (the
+   thumbnail is only a fallback) so the facecam & gameplay sections can
+   be drag-selected on the actual layout BEFORE making clips. */
 async function previewLink() {
   const url = $("urlInput").value.trim();
   if (!url) { toast("Paste a video link first."); return; }
@@ -361,7 +362,8 @@ async function previewLink() {
     if (p.is_live) bits.push("🔴 LIVE");
     $("linkInfo").textContent = bits.join(" · ") || "preview ready";
     const img = $("linkThumb");
-    if (p.thumbnail) { img.src = p.thumbnail; img.hidden = false; }
+    const src = p.frame || p.thumbnail;
+    if (src) { img.src = src; img.hidden = false; }
     else { img.hidden = true; }
   } catch (e) {
     $("linkInfo").textContent = "preview failed — " + e.message + " (you can still make clips)";
