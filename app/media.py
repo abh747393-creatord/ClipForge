@@ -392,9 +392,13 @@ def _fetch_bytes(url, proxy, timeout=30, tries=3) -> bytes:
     used for YouTube on servers is slow and drops often."""
     import urllib.request
     import urllib.error
+    # Explicit proxy wins; otherwise honour the environment's proxy
+    # (http_proxy/https_proxy) — ProxyHandler({}) would DISABLE proxies
+    # entirely and break every fetch on networks that require one
+    # (proven 2026-11-23: SSL WRONG_VERSION_NUMBER on direct egress).
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy
-        else urllib.request.ProxyHandler({}))
+        else urllib.request.ProxyHandler())
     data = b""
     for _ in range(tries):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -550,68 +554,90 @@ def preview_frame(url, out_jpg, meta=None, width=960) -> Path:
 
     # Reuse the caller's already-resolved info when it carries formats —
     # resolving twice roughly doubles preview time on slow connections.
-    fmt = pick((meta or {}).get("raw") or {})
-    i = (meta or {}).get("raw") or {}
-    if not fmt:
-        i = _with_ladder(fetch)
-        fmt = pick(i)
-    if not fmt or not fmt.get("url"):
-        raise RuntimeError("No playable stream URL for a preview frame.")
-    stream_url = fmt["url"]
-
-    is_live = bool(i.get("is_live") or (meta or {}).get("is_live"))
-    duration = float(i.get("duration") or (meta or {}).get("duration") or 0)
+    # But cached formats can be unusable (e.g. DASH without fragments, or
+    # URLs resolved through a different ladder rung), so if every stage
+    # fails on them, re-resolve fresh once and try again.
     out_jpg = Path(out_jpg)
     out_jpg.parent.mkdir(parents=True, exist_ok=True)
-
-    # HLS (all live streams): fetch one segment directly — much faster
-    # than ffmpeg walking the playlist through a slow proxy. For VODs
-    # the last segment is the end of the video, which is fine for
-    # placing facecam/gameplay boxes.
     errors = []
-    proto = str(fmt.get("protocol") or "")
-    if "m3u8" in proto or ".m3u8" in stream_url or "/manifest/" in stream_url:
+
+    def try_stages(fmt, i):
+        stream_url = fmt["url"]
+        is_live = bool(i.get("is_live") or (meta or {}).get("is_live"))
+        duration = float(i.get("duration") or (meta or {}).get("duration") or 0)
+        proto = str(fmt.get("protocol") or "")
+        # HLS (all live streams): fetch one segment directly — much faster
+        # than ffmpeg walking the playlist through a slow proxy. For VODs
+        # the last segment is the end of the video, which is fine for
+        # placing facecam/gameplay boxes.
+        if "m3u8" in proto or ".m3u8" in stream_url or "/manifest/" in stream_url:
+            try:
+                return _hls_frame(stream_url, out_jpg, width=width)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"hls: {e}")
+                print(f"[clipforge] preview-frame hls stage failed: {e}", flush=True)
+        # YouTube live/post-live broadcasts serve http_dash_segments formats:
+        # one segment per sq= request. Fetch init + one segment directly —
+        # ffmpeg on the base URL dies with Input/output error.
+        if "dash_segments" in proto or fmt.get("fragments"):
+            try:
+                return _dash_segments_frame(fmt, out_jpg, width=width, live=is_live)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"dash: {e}")
+                print(f"[clipforge] preview-frame dash stage failed: {e}", flush=True)
+        # ffmpeg fallback: on a DASH base URL ffmpeg dies (single-segment
+        # endpoint) — if any HLS format exists, point ffmpeg at its playlist
+        # instead, which it handles natively.
+        if "dash" in proto:
+            for f in (i.get("formats") or []):
+                if f.get("url") and "m3u8" in str(f.get("protocol") or ""):
+                    stream_url = f["url"]
+                    break
+        cmd = ["ffmpeg", "-y", "-v", "error", "-rw_timeout", "25000000"]
+        proxy = _proxy_url()
+        if proxy:
+            cmd += ["-http_proxy", proxy]
+        if not is_live:
+            t = max(3.0, min(30.0, duration * 0.1)) if duration else 10.0
+            cmd += ["-ss", f"{t:.3f}"]
+        cmd += ["-i", stream_url, "-frames:v", "1", "-vf", f"scale={int(width)}:-2",
+                "-q:v", "3", str(out_jpg)]
+        p = run(cmd, timeout=90)
+        if p.returncode != 0 or not out_jpg.is_file():
+            tail = (p.stderr or "")[-300:]
+            print(f"[clipforge] preview-frame ffmpeg stage failed: {tail}", flush=True)
+            raise RuntimeError(f"ffmpeg: {tail}")
+        return out_jpg
+
+    cached_raw = (meta or {}).get("raw") or {}
+    fmt = pick(cached_raw)
+    if fmt and fmt.get("url"):
         try:
-            return _hls_frame(stream_url, out_jpg, width=width)
+            return try_stages(fmt, cached_raw)
         except Exception as e:  # noqa: BLE001
-            errors.append(f"hls: {e}")
-            print(f"[clipforge] preview-frame hls stage failed: {e}", flush=True)
-
-    # YouTube live/post-live broadcasts serve http_dash_segments formats:
-    # one segment per sq= request. Fetch init + one segment directly —
-    # ffmpeg on the base URL dies with Input/output error.
-    if "dash_segments" in proto or fmt.get("fragments"):
-        try:
-            return _dash_segments_frame(fmt, out_jpg, width=width, live=is_live)
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"dash: {e}")
-            print(f"[clipforge] preview-frame dash stage failed: {e}", flush=True)
-
-    # ffmpeg fallback: on a DASH base URL ffmpeg dies (single-segment
-    # endpoint) — if any HLS format exists, point ffmpeg at its playlist
-    # instead, which it handles natively.
-    if "dash" in proto:
-        for f in (i.get("formats") or []):
-            if f.get("url") and "m3u8" in str(f.get("protocol") or ""):
-                stream_url = f["url"]
-                break
-
-    cmd = ["ffmpeg", "-y", "-v", "error", "-rw_timeout", "25000000"]
-    proxy = _proxy_url()
-    if proxy:
-        cmd += ["-http_proxy", proxy]
-    if not is_live:
-        t = max(3.0, min(30.0, duration * 0.1)) if duration else 10.0
-        cmd += ["-ss", f"{t:.3f}"]
-    cmd += ["-i", stream_url, "-frames:v", "1", "-vf", f"scale={int(width)}:-2",
-            "-q:v", "3", str(out_jpg)]
-    p = run(cmd, timeout=90)
-    if p.returncode != 0 or not out_jpg.is_file():
-        tail = (p.stderr or "")[-300:]
-        print(f"[clipforge] preview-frame ffmpeg stage failed: {tail}", flush=True)
+            errors.append(f"cached formats: {e}")
+            print(f"[clipforge] preview-frame cached formats failed, re-resolving: {e}",
+                  flush=True)
+    else:
+        print("[clipforge] preview-frame: no usable format in cached info, resolving fresh",
+              flush=True)
+    try:
+        i = _with_ladder(fetch)
+    except Exception as e:  # noqa: BLE001
+        print(f"[clipforge] preview-frame resolve failed: {e}", flush=True)
         raise RuntimeError("Preview frame failed (" + " | ".join(errors) +
-                           f" | ffmpeg: {tail})")
-    return out_jpg
+                           f" | resolve: {e})") from e
+    fmt = pick(i)
+    if not fmt or not fmt.get("url"):
+        print("[clipforge] preview-frame: no playable stream URL after fresh resolve",
+              flush=True)
+        raise RuntimeError("Preview frame failed (" + " | ".join(errors) +
+                           " | no playable stream URL)")
+    try:
+        return try_stages(fmt, i)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("Preview frame failed (" + " | ".join(errors) +
+                           f" | {e})") from e
 
 
 def friendly_error(exc, url="") -> str:

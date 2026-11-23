@@ -19,7 +19,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import assets, brain, captions, config, facecam, jobs, layouts, live, llm, media, presets, preview, publish
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 UPLOAD_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 STATIC_FILES = {"style.css", "app.js"}
 
@@ -443,7 +443,9 @@ async def link_preview_frame(payload: dict):
             fp = media.preview_frame(url, Path(td) / "frame.jpg", meta=m)
             frame = "data:image/jpeg;base64," + base64.b64encode(fp.read_bytes()).decode()
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, media.friendly_error(e, url)) from e
+        detail = media.friendly_error(e, url)
+        print(f"[clipforge] preview-frame FAILED for {url}: {detail}", flush=True)
+        raise HTTPException(400, detail) from e
     return {"frame": frame}
 
 
@@ -862,6 +864,8 @@ async def phone_login(payload: dict):
 
 
 def main() -> None:
+    print(f"[clipforge] ClipForge v{VERSION} starting (code marker: preview-frame-diag-1)",
+          flush=True)
     for line in assets.ensure_assets():
         print(f"[clipforge] {line}")
     uvicorn.run(app, host=config.HOST, port=config.PORT)
