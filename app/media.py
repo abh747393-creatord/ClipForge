@@ -386,6 +386,74 @@ def frame_at(src, t, out_jpg, width=960) -> Path:
     return out_jpg
 
 
+def _fetch_bytes(url, proxy, timeout=30, tries=3) -> bytes:
+    """GET a URL (through the configured proxy when set), resuming with
+    Range requests when the connection drops mid-body — the tunnel path
+    used for YouTube on servers is slow and drops often."""
+    import urllib.request
+    import urllib.error
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy
+        else urllib.request.ProxyHandler({}))
+    data = b""
+    for _ in range(tries):
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if data:
+            headers["Range"] = f"bytes={len(data)}-"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                if data and r.status != 206:  # server ignored Range: restart
+                    data = b""
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            return data
+        except Exception:
+            if not data:
+                continue
+            # partial body kept; next try resumes from len(data)
+            continue
+    if data:
+        return data
+    raise RuntimeError(f"Could not fetch {url[:80]}")
+
+
+def _hls_frame(playlist_url, out_jpg, width=960) -> Path:
+    """One frame from an HLS playlist by fetching a single segment
+    directly (init segment + last media segment) and decoding it
+    locally. Far fewer round-trips than letting ffmpeg walk the
+    playlist through a slow proxy."""
+    import urllib.parse
+    proxy = _proxy_url()
+    pl = _fetch_bytes(playlist_url, proxy).decode("utf-8", "replace")
+    segs, init = [], None
+    for line in pl.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-MAP:"):
+            for part in line.split(","):
+                if part.startswith('URI="'):
+                    init = urllib.parse.urljoin(playlist_url, part[5:].strip('"'))
+        elif line and not line.startswith("#"):
+            segs.append(urllib.parse.urljoin(playlist_url, line))
+    if not segs:
+        raise RuntimeError("No segments in HLS playlist.")
+    data = (_fetch_bytes(init, proxy) if init else b"") + _fetch_bytes(segs[-1], proxy)
+    seg = Path(out_jpg).with_suffix(".seg.ts")
+    seg.parent.mkdir(parents=True, exist_ok=True)
+    seg.write_bytes(data)
+    try:
+        p = run(["ffmpeg", "-y", "-v", "error", "-i", str(seg), "-frames:v", "1",
+                 "-vf", f"scale={int(width)}:-2", "-q:v", "3", str(out_jpg)], timeout=60)
+        if p.returncode != 0 or not Path(out_jpg).is_file():
+            raise RuntimeError(f"Segment frame decode failed: {(p.stderr or '')[-300:]}")
+    finally:
+        seg.unlink(missing_ok=True)
+    return Path(out_jpg)
+
+
 def preview_frame(url, out_jpg, meta=None, width=960) -> Path:
     """A REAL frame from the video at `url` (not the thumbnail), so the user
     can drag-select the facecam/gameplay sections on the actual layout.
@@ -402,32 +470,60 @@ def preview_frame(url, out_jpg, meta=None, width=960) -> Path:
         with _ydl(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
-    i = _with_ladder(fetch)
-    stream_url = i.get("url") or ""
-    if not stream_url:
+    def pick(i):
+        """Best format dict for a preview frame, or None."""
+        if i.get("url"):
+            return i
         for f in i.get("requested_formats") or []:
             if f.get("url") and f.get("vcodec") not in (None, "none"):
-                stream_url = f["url"]
-                break
-    if not stream_url:
-        for f in reversed(i.get("formats") or []):
-            if f.get("url") and f.get("vcodec") not in (None, "none"):
-                stream_url = f["url"]
-                break
-    if not stream_url:
+                return f
+        cands = [f for f in (i.get("formats") or [])
+                 if f.get("url") and f.get("vcodec") not in (None, "none")]
+        if cands:
+            # A preview frame only needs to be clear enough to place boxes:
+            # prefer 360–480p so the grab is fast even on slow connections.
+            cands.sort(key=lambda f: f.get("height") or 0)
+            mid = [f for f in cands if 360 <= (f.get("height") or 0) <= 480]
+            if mid:
+                return mid[0]
+            low = [f for f in cands if (f.get("height") or 9999) <= 720]
+            return low[-1] if low else cands[0]
+        return None
+
+    # Reuse the caller's already-resolved info when it carries formats —
+    # resolving twice roughly doubles preview time on slow connections.
+    fmt = pick((meta or {}).get("raw") or {})
+    i = (meta or {}).get("raw") or {}
+    if not fmt:
+        i = _with_ladder(fetch)
+        fmt = pick(i)
+    if not fmt or not fmt.get("url"):
         raise RuntimeError("No playable stream URL for a preview frame.")
+    stream_url = fmt["url"]
 
     is_live = bool(i.get("is_live") or (meta or {}).get("is_live"))
     duration = float(i.get("duration") or (meta or {}).get("duration") or 0)
-    cmd = ["ffmpeg", "-y", "-v", "error"]
+    out_jpg = Path(out_jpg)
+    out_jpg.parent.mkdir(parents=True, exist_ok=True)
+
+    # HLS (all live streams): fetch one segment directly — much faster
+    # than ffmpeg walking the playlist through a slow proxy. For VODs
+    # the last segment is the end of the video, which is fine for
+    # placing facecam/gameplay boxes.
+    proto = str(fmt.get("protocol") or "")
+    if "m3u8" in proto or ".m3u8" in stream_url or "/manifest/" in stream_url:
+        try:
+            return _hls_frame(stream_url, out_jpg, width=width)
+        except Exception:
+            pass  # fall through to the ffmpeg grab below
+
+    cmd = ["ffmpeg", "-y", "-v", "error", "-rw_timeout", "25000000"]
     proxy = _proxy_url()
     if proxy:
         cmd += ["-http_proxy", proxy]
     if not is_live:
         t = max(3.0, min(30.0, duration * 0.1)) if duration else 10.0
         cmd += ["-ss", f"{t:.3f}"]
-    out_jpg = Path(out_jpg)
-    out_jpg.parent.mkdir(parents=True, exist_ok=True)
     cmd += ["-i", stream_url, "-frames:v", "1", "-vf", f"scale={int(width)}:-2",
             "-q:v", "3", str(out_jpg)]
     p = run(cmd, timeout=90)
