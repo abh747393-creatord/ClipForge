@@ -397,7 +397,10 @@ async def export_zip(job_id: str):
 @app.post("/api/preview")
 async def link_preview(payload: dict):
     """Link preview before a job starts (PeakCut /api/preview): title,
-    uploader, duration, thumbnail, is-live — no download."""
+    uploader, duration, thumbnail, is-live — no download. Also grabs one
+    REAL frame from the video (data URI in "frame") so the facecam /
+    gameplay sections can be drag-selected on the actual layout; the
+    thumbnail stays as the fallback when the grab fails."""
     url = (payload.get("url") or "").strip()
     if not url or not media.site_allowed(url):
         raise HTTPException(400, "That link is not supported.")
@@ -406,10 +409,19 @@ async def link_preview(payload: dict):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, media.friendly_error(e, url)) from e
     raw = m.get("raw") or {}
+    frame = ""
+    try:
+        import base64
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fp = media.preview_frame(url, Path(td) / "frame.jpg", meta=m)
+            frame = "data:image/jpeg;base64," + base64.b64encode(fp.read_bytes()).decode()
+    except Exception:  # noqa: BLE001 - preview still works with the thumbnail
+        frame = ""
     return {"title": m.get("title") or "", "uploader": m.get("uploader") or "",
             "duration": m.get("duration") or 0, "is_live": bool(m.get("is_live")),
             "width": m.get("width") or 0, "height": m.get("height") or 0,
-            "thumbnail": raw.get("thumbnail") or ""}
+            "thumbnail": raw.get("thumbnail") or "", "frame": frame}
 
 
 @app.get("/api/readiness")
