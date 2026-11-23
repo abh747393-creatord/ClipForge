@@ -707,11 +707,15 @@ def watchlist_newest(platform, handle, words=None, max_age_h=48):
     return None
 
 
-def resolve_live(url) -> dict:
+def resolve_live(url, height=1080) -> dict:
     """Direct stream URLs for a live link: {"urls": [...], "title": str}.
-    Raises ValueError("not live") if the link is not currently live."""
+    Raises ValueError("not live") if the link is not currently live.
+    `height` caps the recorded quality (the streamer's own top quality
+    up to that cap) — facecam crops upscale badly from low-res sources,
+    so live recording defaults to 1080p."""
+    h = int(height or 1080)
     def fetch(extra):
-        opts = {"format": "b[height<=720]/bv*[height<=720]+ba/b"}
+        opts = {"format": f"b[height<={h}]/bv*[height<={h}]+ba/b"}
         opts.update(extra)
         with _ydl(opts) as ydl:
             return ydl.extract_info(url, download=False)
