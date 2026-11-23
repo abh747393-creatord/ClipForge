@@ -30,9 +30,16 @@ set NEWVER=unknown
 for /f "tokens=3 delims= " %%v in ('findstr /c:"VERSION =" "%TEMP%\clipforge-update\ClipForge-main\app\server.py"') do set NEWVER=%%~v
 echo Download mein version: %NEWVER%
 
+:: Pehle se latest hai to copy ki zaroorat nahi
+if "%OLDVER%"=="%NEWVER%" (
+    echo Pehle se latest version hai - copy skip kar rahi hun.
+    del "%TEMP%\clipforge-update.zip" >nul 2>&1
+    rmdir /s /q "%TEMP%\clipforge-update" >nul 2>&1
+    goto :start_app
+)
+
 :: Isi folder par copy karo (.venv aur data ko haath nahi lagana)
-robocopy "%TEMP%\clipforge-update\ClipForge-main" "%~dp0" /E /XD .venv data __pycache__ /XF "Update-ClipForge.bat" > "%TEMP%\clipforge-copy.log"
-if errorlevel 8 goto :copyfail
+robocopy "%TEMP%\clipforge-update\ClipForge-main" "%~dp0" /E /XD .venv data __pycache__ /XF "Update-ClipForge.bat" /R:2 /W:1 > "%TEMP%\clipforge-copy.log"
 
 :: Purana bytecode saaf karo taake purana code na chale
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -Path '%~dp0app' -Recurse -Directory -Filter __pycache__ -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"
