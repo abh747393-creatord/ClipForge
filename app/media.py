@@ -25,9 +25,15 @@ ALLOWED_HOSTS = {
 _BOT_CHECK = re.compile(r"not a bot|confirm you.?re not|sign in to confirm(?! your age)|http error 403|http error 429|too many requests", re.I)
 
 # Errors where another route (player client / proxy / cookies) may succeed.
+# Proxy/connection failures count too: a dead proxy must fall through to the
+# direct attempts, never kill the whole ladder on the first try.
 _RETRYABLE = re.compile(
     r"not a bot|confirm you.?re not|sign in|confirm your age|age-restricted|"
-    r"no video formats|login required|http error 403|http error 429|too many requests", re.I)
+    r"no video formats|login required|http error 403|http error 429|too many requests|"
+    r"unable to connect to proxy|proxyerror|connection refused|connection aborted|"
+    r"connection reset|transporterror|remote end closed|broken pipe|eof occurred|"
+    r"failed to establish a new connection|name or service not known|"
+    r"temporary failure in name resolution|timed? ?out", re.I)
 
 
 def run(cmd, **kw):
@@ -128,6 +134,10 @@ def _ladder_attempts():
     cfb = _cookie_browser()
     if cfb:
         attempts.append({"cookiesfrombrowser": cfb})
+    if proxy:
+        # The tunnel/proxy can flap for a few seconds (restart, reconnect);
+        # by the time the ladder gets here it has usually settled.
+        attempts.append({"proxy": proxy, "nocheckcertificate": True})
     return attempts
 
 
@@ -391,6 +401,9 @@ def friendly_error(exc, url="") -> str:
         return ("YouTube isn't serving this video to this connection (common on servers and "
                 "VPNs, especially for live streams). Download it in your browser, then upload "
                 "the file here.")
+    if "proxy" in low or "connection refused" in low:
+        return ("Couldn't reach YouTube from this connection right now. Wait a minute and try "
+                "again, or download the video in your browser and upload the file here.")
     if "kick" in str(url) and ("403" in text or "forbidden" in low):
         return "Kick blocked the download. Download it in your browser, then upload the file here."
     if "subscriber" in low or "sub-only" in low or "only available to" in low:
