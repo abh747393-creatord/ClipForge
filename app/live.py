@@ -146,7 +146,7 @@ class LiveSession:
     # ------------------------------------------------------------------ ingest
     def _run(self) -> None:
         try:
-            resolved = media.resolve_live(self.url)
+            resolved = media.resolve_live(self.url, height=int(self.options.get("quality") or 1080))
             self.title = resolved.get("title") or ""
             urls = list(resolved.get("urls") or [])
             if not urls:
@@ -182,7 +182,7 @@ class LiveSession:
                 break
             self._stop.wait(3)
             try:  # stream addresses expire; resolve fresh ones for the restart
-                resolved = media.resolve_live(self.url)
+                resolved = media.resolve_live(self.url, height=int(self.options.get("quality") or 1080))
                 urls = list(resolved.get("urls") or urls)
             except Exception:  # noqa: BLE001 - keep the old urls and let ffmpeg try
                 pass
