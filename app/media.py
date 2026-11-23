@@ -397,7 +397,10 @@ def _fetch_bytes(url, proxy, timeout=30, tries=3) -> bytes:
         else urllib.request.ProxyHandler({}))
     data = b""
     for _ in range(tries):
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                 "Chrome/124.0 Safari/537.36",
+                   "Referer": "https://www.youtube.com/"}
         if data:
             headers["Range"] = f"bytes={len(data)}-"
         req = urllib.request.Request(url, headers=headers)
@@ -461,20 +464,31 @@ def _dash_segments_frame(fmt, out_jpg, width=960, live=False) -> Path:
     with Input/output error — these URLs serve a single segment per sq=
     request and do not support byte-range seeking."""
     import re
-    base, count = None, 0
+    base, count, sq_values = None, 0, []
     for fr in fmt.get("fragments") or []:
         u = fr.get("url") or ""
         if not u and fr.get("path"):
             u = (fmt.get("fragment_base_url") or "") + fr["path"]
-        if re.search(r"sq[=/]\d+", u):
-            base = u
-            count = int(fr.get("fragment_count") or 0)
-            break
+        m = re.search(r"sq[=/](\d+)", u)
+        if m:
+            sq_values.append(int(m.group(1)))
+            if base is None:
+                base = u
+                count = int(fr.get("fragment_count") or 0)
     if not base:
         raise RuntimeError("No sq= fragment URL in DASH format.")
     sep = "=" if "sq=" in base else "/"
     if live:
-        seg_no = max(1, count - 2) if count else 1
+        # Live broadcasts often carry no fragment_count; the fragments list
+        # itself names the segments that exist — take the newest one.
+        # (Fetching sq=1 blindly grabs the stream's first segment, which
+        # is long gone on a multi-hour live: the PC 400s of 2026-11-23.)
+        if sq_values:
+            seg_no = max(1, max(sq_values) - 1)
+        elif count:
+            seg_no = max(1, count - 2)
+        else:
+            seg_no = 1
     else:
         seg_no = max(1, int(count * 0.1)) if count else 10
     proxy = _proxy_url()
@@ -522,7 +536,11 @@ def preview_frame(url, out_jpg, meta=None, width=960) -> Path:
         if cands:
             # A preview frame only needs to be clear enough to place boxes:
             # prefer 360–480p so the grab is fast even on slow connections.
-            cands.sort(key=lambda f: f.get("height") or 0)
+            # HLS (m3u8) formats first: their frame grab is far more reliable
+            # than http_dash_segments, whose live segment numbering is
+            # often unknown (the PC 400s of 2026-11-23).
+            cands.sort(key=lambda f: ("dash" in str(f.get("protocol") or ""),
+                                      f.get("height") or 0))
             mid = [f for f in cands if 360 <= (f.get("height") or 0) <= 480]
             if mid:
                 return mid[0]
@@ -550,12 +568,14 @@ def preview_frame(url, out_jpg, meta=None, width=960) -> Path:
     # than ffmpeg walking the playlist through a slow proxy. For VODs
     # the last segment is the end of the video, which is fine for
     # placing facecam/gameplay boxes.
+    errors = []
     proto = str(fmt.get("protocol") or "")
     if "m3u8" in proto or ".m3u8" in stream_url or "/manifest/" in stream_url:
         try:
             return _hls_frame(stream_url, out_jpg, width=width)
-        except Exception:
-            pass  # fall through to the ffmpeg grab below
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"hls: {e}")
+            print(f"[clipforge] preview-frame hls stage failed: {e}", flush=True)
 
     # YouTube live/post-live broadcasts serve http_dash_segments formats:
     # one segment per sq= request. Fetch init + one segment directly —
@@ -563,8 +583,18 @@ def preview_frame(url, out_jpg, meta=None, width=960) -> Path:
     if "dash_segments" in proto or fmt.get("fragments"):
         try:
             return _dash_segments_frame(fmt, out_jpg, width=width, live=is_live)
-        except Exception:
-            pass  # fall through to the ffmpeg grab below
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"dash: {e}")
+            print(f"[clipforge] preview-frame dash stage failed: {e}", flush=True)
+
+    # ffmpeg fallback: on a DASH base URL ffmpeg dies (single-segment
+    # endpoint) — if any HLS format exists, point ffmpeg at its playlist
+    # instead, which it handles natively.
+    if "dash" in proto:
+        for f in (i.get("formats") or []):
+            if f.get("url") and "m3u8" in str(f.get("protocol") or ""):
+                stream_url = f["url"]
+                break
 
     cmd = ["ffmpeg", "-y", "-v", "error", "-rw_timeout", "25000000"]
     proxy = _proxy_url()
@@ -577,7 +607,10 @@ def preview_frame(url, out_jpg, meta=None, width=960) -> Path:
             "-q:v", "3", str(out_jpg)]
     p = run(cmd, timeout=90)
     if p.returncode != 0 or not out_jpg.is_file():
-        raise RuntimeError(f"Preview frame grab failed: {(p.stderr or '')[-500:]}")
+        tail = (p.stderr or "")[-300:]
+        print(f"[clipforge] preview-frame ffmpeg stage failed: {tail}", flush=True)
+        raise RuntimeError("Preview frame failed (" + " | ".join(errors) +
+                           f" | ffmpeg: {tail})")
     return out_jpg
 
 
