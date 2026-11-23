@@ -7,9 +7,11 @@ One ffmpeg process per session does two jobs at once:
 
 Segment timing: ffmpeg writes a CSV list per recorder part (name,start,end
 relative to that part). Each part's session-clock base is the audio clock at
-the moment the part started. This is an approximation — the segment clock and
-the audio clock can drift a few seconds over an hour, and unlike PeakCut we
-do not re-align clips by re-transcribing them (known gap).
+the moment the part started. The segment clock and the audio clock can drift
+a few seconds over an hour, so each clip is re-aligned before rendering:
+the clip's own audio is re-transcribed and word times are median-matched
+against the live words (PeakCut's _align), and the caption words are shifted
+by that offset.
 
 Triggers (checked every 2 s by the monitor thread):
   * schedule: every ai_every_min minutes, clip the last ai_every_min*60+90 s
@@ -76,6 +78,7 @@ class LiveSession:
         self.words: list = []        # {"start","end","text"} on the session clock
         self.loud_hist: list = []    # dB per second
         self.chat_hist: list = []    # messages per second (index = session second)
+        self.chat_people: list = []  # distinct chatters per second (PeakCut counts people, not messages)
         self.segments: list = []     # (Path, start, end) on the session clock
 
         self._stop = threading.Event()
@@ -338,10 +341,14 @@ class LiveSession:
                             sock.sendall(b"PONG :tmi.twitch.tv\r\n")
                         elif b" PRIVMSG #" in line:
                             sec = int(self.audio_seconds)
+                            nick = line.split(b"!", 1)[0].lstrip(b":").decode("utf-8", "replace")
                             with self._lock:
                                 while len(self.chat_hist) <= sec:
                                     self.chat_hist.append(0)
+                                    self.chat_people.append(set())
                                 self.chat_hist[sec] += 1
+                                if nick:
+                                    self.chat_people[sec].add(nick.lower())
                 sock.close()
             except Exception:  # noqa: BLE001 - chat is a bonus signal, never fatal
                 fails += 1
@@ -374,6 +381,14 @@ class LiveSession:
                 pass
             self._last_seg_wall = time.time()  # give the restart time to produce segments
 
+    def _chat_series(self) -> list:
+        """Chat activity per second: distinct people when nick data exists
+        (PeakCut counts people, not messages), else message counts."""
+        with self._lock:
+            if self.chat_people and any(self.chat_people):
+                return [len(s) for s in self.chat_people]
+            return list(self.chat_hist)
+
     def _update_hype(self) -> None:
         """Hype 0-100. With >= 60 s of history it is relative: the last-5 s
         loudness (linear) and last-8 s chat rate against their trailing
@@ -381,7 +396,7 @@ class LiveSession:
         Before that, an absolute loudness scale: -45 dB -> 0, -10 dB -> 100."""
         with self._lock:
             loud = list(self.loud_hist)
-            chat = list(self.chat_hist)
+        chat = self._chat_series()
         if len(loud) < 5:
             self.hype = 0
             return
@@ -415,7 +430,7 @@ class LiveSession:
         # spike: loudness or chat jumps 1.6x over the trailing 3-minute average
         with self._lock:
             loud = list(self.loud_hist)
-            chat = list(self.chat_hist)
+        chat = self._chat_series()
         if len(loud) >= 190 and now - self._last_spike_at >= 60:
             amp = [10 ** (db / 20.0) for db in loud]
             loud_now = sum(amp[-5:]) / 5.0
@@ -475,6 +490,35 @@ class LiveSession:
         if now < 5:
             raise ValueError("Nothing has been recorded yet.")
         self._make_clip(now - float(seconds), now, "manual")
+
+    def _judge_window(self, a: float, b: float, win_rel: list) -> dict:
+        """PeakCut two-judge check. Words judge: LLM score over the window
+        transcript (None when no LLM / too little speech — never blocks).
+        Reaction judge: loudness + chat surge inside the window vs the
+        trailing baseline, 0-100. Mode 'both' needs both; 'either' needs
+        one strong pass."""
+        min_score = float(self.options.get("live_min_score") or 80)
+        mode = str(self.options.get("live_decide") or "either")
+        words_score = None
+        text = " ".join(w["text"] for w in win_rel)
+        if len(text.split()) >= 4:
+            try:
+                from . import llm as _llm
+                if _llm.available():
+                    judged = brain._llm_judge(text, focus=str(self.options.get("focus") or ""))
+                    if judged and judged.get("score") is not None:
+                        words_score = round(float(judged["score"]) * 10)
+            except Exception:  # noqa: BLE001 - judge is best-effort
+                words_score = None
+        reaction = _reaction_score(self.loud_hist, self._chat_series(), a, b)
+        if words_score is None:
+            passed = reaction >= 60
+        elif mode == "both":
+            passed = words_score >= min_score and reaction >= 50
+        else:
+            passed = words_score >= min_score or reaction >= 75
+        return {"words": words_score, "reaction": reaction, "mode": mode,
+                "min_score": min_score, "passed": bool(passed)}
 
     def _make_clip_work(self, a: float, b: float, trigger: str) -> None:
         with self._lock:
@@ -543,10 +587,39 @@ class LiveSession:
                 if desc.get(k):
                     clip[k] = desc[k]
 
+            # Two-judge gate (PeakCut): when live_judge is on, an auto clip
+            # must convince the words judge (LLM over the transcript) and/or
+            # the reaction judge (loudness/chat surge in the window).
+            if trigger != "manual" and self.options.get("live_judge"):
+                verdict = self._judge_window(a, b, win_rel)
+                clip["judges"] = verdict
+                if not verdict["passed"]:
+                    clip["status"] = "rejected"
+                    clip["error"] = None
+                    clip["reason"] = f"{trigger} · judge rejected (words {verdict['words']}, reaction {verdict['reaction']})"
+                    return
+
+            # A/V drift correction (PeakCut _align): re-transcribe the clip's
+            # own audio and median-match word times against the live words;
+            # shift the caption words by the measured offset.
+            clock_fix = 0.0
+            if words_snapshot:
+                try:
+                    asr_dir = self.clips_dir / f"{name}_asr"
+                    asr_dir.mkdir(parents=True, exist_ok=True)
+                    res = transcribe.transcribe(src, 0, src_dur, asr_dir,
+                                                language=jobs._language_for(self.options),
+                                                model=self.options.get("caption_model"),
+                                                report=lambda *_a, **_k: None)
+                    clock_fix = _align_offset(res.get("words") or [], words_snapshot, seg0_time)
+                except Exception:  # noqa: BLE001 - alignment is best-effort
+                    clock_fix = 0.0
+            clip["clock_fix"] = round(clock_fix, 3)
+
             # render wants words on the concat file's timeline:
-            # file_time = session_time - seg0_time (segment clock; see module note on drift)
-            words_src = [{"start": max(0.0, float(w["start"]) - seg0_time),
-                          "end": max(0.0, float(w["end"]) - seg0_time), "text": w["text"]}
+            # file_time = session_time - seg0_time (segment clock) + clock_fix
+            words_src = [{"start": max(0.0, float(w["start"]) - seg0_time + clock_fix),
+                          "end": max(0.0, float(w["end"]) - seg0_time + clock_fix), "text": w["text"]}
                          for w in words_snapshot
                          if float(w["end"]) > seg0_time and float(w["start"]) < seg0_time + src_dur]
             clip_for_render = dict(clip, start=a - seg0_time, end=b - seg0_time)
@@ -558,6 +631,63 @@ class LiveSession:
         except Exception as e:  # noqa: BLE001 - one failed clip must not stop the session
             clip["status"] = "error"
             clip["error"] = str(e)
+
+
+def _norm_word(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def _align_offset(file_words: list, live_words: list, seg0_time: float) -> float:
+    """Median clock offset between the concat file's audio and the live
+    session clock (PeakCut _align). file_words are on the file timeline;
+    live_words on the session clock, so expected file time is
+    live_start - seg0_time. Returns median(file - expected) over matched
+    same-text words, or 0.0 when fewer than 5 matches."""
+    live = [(_norm_word(w.get("text")), float(w.get("start") or 0) - seg0_time)
+            for w in (live_words or [])]
+    live = [(t, s) for t, s in live if t]
+    if not live:
+        return 0.0
+    diffs = []
+    for w in file_words or []:
+        t = _norm_word(w.get("text"))
+        if not t:
+            continue
+        fs = float(w.get("start") or 0)
+        best = None
+        for lt, ls in live:
+            if lt == t and abs(fs - ls) <= 8.0:
+                d = fs - ls
+                if best is None or abs(d) < abs(best):
+                    best = d
+        if best is not None:
+            diffs.append(best)
+    if len(diffs) < 5:
+        return 0.0
+    diffs.sort()
+    mid = diffs[len(diffs) // 2]
+    return mid if abs(mid) <= 10.0 else 0.0
+
+
+def _reaction_score(loud_hist: list, chat_series: list, a: float, b: float) -> int:
+    """0-100 surge score for [a, b]: window loudness (linear) and chat rate
+    vs the trailing 3-minute baseline before the window."""
+    scores = []
+    ia, ib = max(0, int(a)), max(int(a) + 1, int(b))
+    if loud_hist and len(loud_hist) > ia:
+        amp = [10 ** (db / 20.0) for db in loud_hist]
+        win = amp[ia:ib]
+        base = amp[max(0, ia - 180):ia]
+        if win and base:
+            ratio = (sum(win) / len(win)) / max(1e-9, sum(base) / len(base))
+            scores.append(max(0.0, min(100.0, (ratio - 0.5) / 1.5 * 100)))
+    if chat_series and len(chat_series) > ia:
+        win = chat_series[ia:ib]
+        base = chat_series[max(0, ia - 180):ia]
+        if win and base and sum(base) > 0:
+            ratio = (sum(win) / len(win)) / (sum(base) / len(base))
+            scores.append(max(0.0, min(100.0, (ratio - 0.5) / 1.5 * 100)))
+    return int(round(max(scores))) if scores else 0
 
 
 # ---------------------------------------------------------------------- module API
@@ -577,3 +707,72 @@ def stop_session(session_id: str):
     if session:
         session.stop()
     return session
+
+
+# ------------------------------------------------------------------ auto-record watch
+def _watchlist_urls() -> list:
+    """Watchlist entries (data/watchlist.txt, 'platform:handle' per line)
+    turned into channel URLs whose live state can be checked."""
+    p = config.DATA_DIR / "watchlist.txt"
+    if not p.exists():
+        return []
+    out = []
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        who = line.partition("|")[0].strip()
+        platform, _, handle = who.partition(":")
+        handle = handle.strip()
+        if not handle:
+            continue
+        if platform == "twitch":
+            out.append(f"https://www.twitch.tv/{handle}")
+        elif platform == "kick":
+            out.append(f"https://kick.com/{handle}")
+        elif platform == "youtube":
+            if handle.startswith("UC"):
+                out.append(f"https://www.youtube.com/channel/{handle}/live")
+            else:
+                out.append(f"https://www.youtube.com/@{handle.lstrip('@')}/live")
+    return out
+
+
+def _is_live(url: str) -> bool:
+    try:
+        return bool(media.info(url).get("is_live"))
+    except Exception:  # noqa: BLE001 - a failed check just means "not now"
+        return False
+
+
+def _auto_record_on() -> bool:
+    try:
+        import json as _json
+        data = _json.loads((config.DATA_DIR / "settings.json").read_text(encoding="utf-8"))
+        return bool(data.get("auto_record"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def watch_loop(store, interval: int = 120) -> None:
+    """PeakCut/NeonClipping creator watcher: every `interval` seconds, when
+    auto_record is on in Settings, check watchlist channels and start a live
+    session for any that just went live (one session per URL)."""
+    while True:
+        try:
+            if _auto_record_on():
+                active = {s.url for s in SESSIONS.values()
+                          if s.status in ("starting", "recording")}
+                for url in _watchlist_urls():
+                    if url in active:
+                        continue
+                    if _is_live(url):
+                        start_session(url, {}, store)
+        except Exception:  # noqa: BLE001 - the watcher must keep watching
+            pass
+        time.sleep(interval)
+
+
+def start_watcher(store) -> None:
+    threading.Thread(target=watch_loop, args=(store,), daemon=True,
+                     name="live-watch").start()

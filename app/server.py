@@ -15,16 +15,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import assets, captions, config, facecam, jobs, layouts, live, llm, media, presets, publish
+from . import assets, brain, captions, config, facecam, jobs, layouts, live, llm, media, presets, preview, publish
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 UPLOAD_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 STATIC_FILES = {"style.css", "app.js"}
 
 config.ensure_dirs()
 store = jobs.JobStore()
 store.load_existing()
+live.start_watcher(store)
 
 app = FastAPI(title="ClipForge")
 
@@ -83,6 +84,72 @@ async def list_styles():
 @app.get("/api/presets")
 async def list_presets():
     return presets.catalog()
+
+
+@app.post("/api/caption-preview")
+async def caption_preview(payload: dict):
+    """One still frame with the chosen caption style burned in (same ASS +
+    layout + fonts path as a real render), so the UI can show how captions
+    will look before rendering. Pass job_id to preview over that job's
+    source frame with its facecam/game regions; pass clip_idx too to use a
+    frame from that clip's own moment (the clip editor's live preview)."""
+    from fastapi.responses import Response
+    frame_path, src_w, src_h, facecam, game = None, 0, 0, None, None
+    job_id = str(payload.get("job_id") or "")
+    if job_id:
+        job = store.get(job_id)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        opts = job.get("options") or {}
+        facecam = payload.get("facecam") or opts.get("facecam")
+        game = payload.get("game") or opts.get("game")
+        clip_idx = payload.get("clip_idx")
+        clip = None
+        if clip_idx is not None:
+            try:
+                clip = (job.get("clips") or [])[int(clip_idx)]
+            except (IndexError, TypeError, ValueError):
+                clip = None
+        if clip is not None:
+            facecam = payload.get("facecam") or clip.get("facecam") or facecam
+            game = payload.get("game") or clip.get("game") or game
+            src_str = clip.get("src") or job.get("source_path")
+            if src_str and Path(src_str).exists():
+                try:
+                    pr = media.probe(Path(src_str))
+                    src_w, src_h = int(pr.get("width") or 0), int(pr.get("height") or 0)
+                    t = max(0.0, float(clip["start"]) - float(clip.get("src_offset") or 0.0) + 0.5)
+                    cand = store.dir_for(job_id) / "clips" / f"{clip.get('name') or 'clip'}_edit.jpg"
+                    if not cand.is_file():
+                        media.frame_at(Path(src_str), t, cand, width=src_w or 960)
+                    if cand.is_file():
+                        frame_path = cand
+                except Exception:  # noqa: BLE001 - fall back to the job frame below
+                    frame_path = None
+        if frame_path is None:
+            cand = store.dir_for(job_id) / "frame.jpg"
+            if cand.is_file():
+                frame_path = cand
+                src_w, src_h = int(job.get("width") or 0), int(job.get("height") or 0)
+    try:
+        data = preview.render_preview(
+            style=payload.get("style"), anim=payload.get("anim"),
+            text=payload.get("text"), hook=payload.get("hook"),
+            layout=payload.get("layout"), aspect=payload.get("aspect") or "vertical",
+            top=payload.get("top"), caption_y=payload.get("caption_y"),
+            captions_on=payload.get("captions", True),
+            hook_on=payload.get("hook_enabled", True),
+            frame_path=frame_path, src_w=src_w, src_h=src_h,
+            facecam=facecam, game=game,
+            highlight_words=payload.get("highlight_words"),
+            caption_custom=payload.get("caption_custom"),
+            hook_style=payload.get("hook_style") or "box")
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(500, str(e)) from e
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
 
 
 # ---------------------------------------------------------------------- discover
@@ -326,6 +393,268 @@ async def export_zip(job_id: str):
     return FileResponse(out, media_type="application/zip", filename=f"clipforge-{job_id}.zip")
 
 
+# ---------------------------------------------------------------------- parity additions
+@app.post("/api/preview")
+async def link_preview(payload: dict):
+    """Link preview before a job starts (PeakCut /api/preview): title,
+    uploader, duration, thumbnail, is-live — no download."""
+    url = (payload.get("url") or "").strip()
+    if not url or not media.site_allowed(url):
+        raise HTTPException(400, "That link is not supported.")
+    try:
+        m = media.info(url)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, media.friendly_error(e, url)) from e
+    raw = m.get("raw") or {}
+    return {"title": m.get("title") or "", "uploader": m.get("uploader") or "",
+            "duration": m.get("duration") or 0, "is_live": bool(m.get("is_live")),
+            "width": m.get("width") or 0, "height": m.get("height") or 0,
+            "thumbnail": raw.get("thumbnail") or ""}
+
+
+@app.get("/api/readiness")
+async def readiness():
+    from . import extras
+    return extras.readiness()
+
+
+@app.get("/api/storage")
+async def storage_info():
+    from . import extras
+    return extras.storage_info()
+
+
+@app.get("/api/update-check")
+async def update_check():
+    from . import extras
+    return extras.update_check()
+
+
+@app.get("/api/diagnostics")
+async def diagnostics():
+    """Redacted diagnostics download (NeonClipping 'Report a problem')."""
+    from . import extras
+    from fastapi.responses import Response
+    data = json.dumps(extras.diagnostics(), indent=1, ensure_ascii=False)
+    return Response(content=data, media_type="application/json",
+                    headers={"Content-Disposition": "attachment; filename=clipforge-diagnostics.json"})
+
+
+@app.get("/api/profiles")
+async def list_profiles():
+    from . import extras
+    return extras.list_profiles()
+
+
+@app.post("/api/profiles")
+async def save_profile(payload: dict):
+    from . import extras
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "give the profile a name")
+    return extras.save_profile(name, payload.get("options") or {})
+
+
+@app.delete("/api/profiles/{name}")
+async def delete_profile(name: str):
+    from . import extras
+    return {"deleted": extras.delete_profile(name)}
+
+
+@app.get("/api/feedback/summary")
+async def feedback_summary():
+    from . import learn
+    return learn.summary()
+
+
+@app.post("/api/upload-asset")
+async def upload_asset(file: UploadFile = File(...), kind: str = Form("image")):
+    """Upload a logo/watermark image or a music track (NeonClipping
+    /upload-asset). Returns the server path to put in options
+    (watermark.image / music.path)."""
+    ext = Path(file.filename or "").suffix.lower()
+    if kind == "image" and ext not in (".png", ".jpg", ".jpeg", ".webp"):
+        raise HTTPException(400, "logo must be a PNG, JPG or WebP image")
+    if kind == "audio" and ext not in (".mp3", ".wav", ".m4a", ".ogg", ".flac"):
+        raise HTTPException(400, "music must be MP3, WAV, M4A, OGG or FLAC")
+    if kind not in ("image", "audio"):
+        raise HTTPException(400, "kind must be image or audio")
+    assets_dir = config.DATA_DIR / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    dest = assets_dir / f"{uuid.uuid4().hex}{ext}"
+    with dest.open("wb") as out:
+        shutil.copyfileobj(file.file, out)
+    if kind == "audio":
+        try:
+            media.probe(dest)
+        except Exception as e:  # noqa: BLE001
+            dest.unlink(missing_ok=True)
+            raise HTTPException(400, f"that audio file could not be read: {e}") from e
+    return {"path": str(dest), "name": file.filename or dest.name, "kind": kind}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    try:
+        return jobs.cancel_job(job, store)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.post("/api/jobs/{job_id}/review-select")
+async def review_select(job_id: str, payload: dict):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    try:
+        return jobs.resume_with_selection(job, store, payload.get("indices") or [])
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/jobs/{job_id}/manual-clip")
+async def manual_clip(job_id: str, payload: dict):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    try:
+        return jobs.manual_clip(job, store, payload.get("start"), payload.get("end"),
+                                title=str(payload.get("title") or ""),
+                                hook=str(payload.get("hook") or ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/transcript")
+async def transcript(job_id: str, q: str = ""):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    return jobs.transcript_lines(job, store, q)
+
+
+@app.get("/api/jobs/{job_id}/clips/{idx}/words")
+async def get_clip_words(job_id: str, idx: int):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    try:
+        return {"words": jobs.get_clip_words(job, store, idx)}
+    except IndexError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.post("/api/jobs/{job_id}/clips/{idx}/words")
+async def set_clip_words(job_id: str, idx: int, payload: dict):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    try:
+        clip = jobs.set_clip_words(job, store, idx, payload.get("words") or [])
+        return {"ok": True, "words": len(clip.get("words_override") or [])}
+    except IndexError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.post("/api/jobs/{job_id}/clips/{idx}/subtitles")
+async def import_subtitles(job_id: str, idx: int, payload: dict):
+    """Import SRT/VTT/ASS text as this clip's caption words (times are
+    clip-relative, like a subtitle file made for the clip itself)."""
+    from . import subtitles
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    try:
+        words = subtitles.words_from_text(str(payload.get("text") or ""),
+                                          payload.get("format"))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    try:
+        clip = jobs.set_clip_words(job, store, idx, words)
+        return {"ok": True, "words": len(clip.get("words_override") or [])}
+    except IndexError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.put("/api/jobs/{job_id}/clips/{idx}/text")
+async def clip_text(job_id: str, idx: int, payload: dict):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    try:
+        return jobs.update_clip_text(job, store, idx, payload)
+    except IndexError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.post("/api/jobs/{job_id}/clips/{idx}/write")
+async def clip_write(job_id: str, idx: int):
+    """AI rewrite of the post text (PeakCut /write): fresh title/hook/
+    description/hashtags from the clip's own words."""
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    try:
+        words = jobs.get_clip_words(job, store, idx)
+    except IndexError as e:
+        raise HTTPException(404, str(e)) from e
+    desc = {}
+    try:
+        desc = brain.describe(words, fallback_title=job.get("title") or "")
+    except Exception:  # noqa: BLE001
+        desc = {}
+    if not desc:
+        raise HTTPException(400, "could not write post text for this clip")
+    fields = {k: desc[k] for k in ("title", "hook", "description", "hashtags") if desc.get(k)}
+    return jobs.update_clip_text(job, store, idx, fields)
+
+
+@app.post("/api/jobs/{job_id}/clips/{idx}/rating")
+async def clip_rating(job_id: str, idx: int, payload: dict):
+    from . import learn
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    clips = job.get("clips") or []
+    if idx < 0 or idx >= len(clips):
+        raise HTTPException(404, "clip not found")
+    clip = clips[idx]
+    try:
+        rating = float(payload.get("rating"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "rating must be 1-5")
+    clip["rating"] = max(1, min(5, int(round(rating))))
+    store.save(job)
+    learn.record_rating(job_id, idx, clip["rating"], clip.get("features") or {},
+                        layout=str(clip.get("layout") or ""),
+                        style=str((job.get("options") or {}).get("style") or ""))
+    return {"ok": True, "rating": clip["rating"], "summary": learn.summary()}
+
+
+@app.get("/api/llm/providers")
+async def llm_providers():
+    return llm.PROVIDERS
+
+
+@app.post("/api/llm/models")
+async def llm_models(payload: dict):
+    key = str(payload.get("key") or "")
+    if not key:
+        key = (config.llm_settings() or {}).get("key") or ""
+    return {"models": llm.list_models(payload.get("base_url") or "", key)}
+
+
+@app.post("/api/llm/test")
+async def llm_test(payload: dict):
+    key = str(payload.get("key") or "")
+    if not key:
+        key = (config.llm_settings() or {}).get("key") or ""
+    return llm.test(payload.get("base_url") or "", payload.get("model") or "", key)
+
+
 # ---------------------------------------------------------------------- live
 @app.post("/api/live/start")
 async def live_start(payload: dict):
@@ -383,17 +712,25 @@ def _read_settings() -> dict:
 @app.get("/api/settings")
 async def get_settings():
     s = config.llm_settings() or {}
+    raw = _read_settings()
     return {"llm": {
         "base_url": s.get("base_url") or "",
         "model": s.get("model") or "",
         "has_key": bool(s.get("key")),
-    }}
+    },
+        "discord_webhook": raw.get("discord_webhook") or "",
+        "telegram_chat_id": raw.get("telegram_chat_id") or "",
+        "has_telegram_token": bool(raw.get("telegram_token")),
+        "has_phone_pin": bool(raw.get("phone_pin")),
+        "auto_record": bool(raw.get("auto_record")),
+    }
 
 
 @app.put("/api/settings")
 async def put_settings(payload: dict):
     """Merge into DATA_DIR/settings.json. llm_key semantics: omitted or ""
-    keeps the saved key; explicit null clears it; any other string replaces it."""
+    keeps the saved key; explicit null clears it; any other string replaces it.
+    Same semantics for telegram_token and phone_pin."""
     data = _read_settings()
     if payload.get("llm_base_url") is not None:
         data["llm_base_url"] = str(payload["llm_base_url"])
@@ -406,8 +743,87 @@ async def put_settings(payload: dict):
         elif key != "":
             data["llm_key"] = str(key)
         # "" -> keep existing key
+    if payload.get("discord_webhook") is not None:
+        data["discord_webhook"] = str(payload["discord_webhook"])[:500]
+    if payload.get("telegram_chat_id") is not None:
+        data["telegram_chat_id"] = str(payload["telegram_chat_id"])[:50]
+    if "telegram_token" in payload:
+        tok = payload["telegram_token"]
+        if tok is None:
+            data["telegram_token"] = ""
+        elif tok != "":
+            data["telegram_token"] = str(tok)
+    if "phone_pin" in payload:
+        pin = payload["phone_pin"]
+        if pin is None:
+            data["phone_pin"] = ""
+        elif pin != "":
+            data["phone_pin"] = str(pin)[:12]
+            if not data.get("phone_secret"):
+                data["phone_secret"] = uuid.uuid4().hex
+    if "auto_record" in payload:
+        data["auto_record"] = bool(payload["auto_record"])
     _settings_path().write_text(json.dumps(data, indent=1), encoding="utf-8")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------- phone remote
+def _phone_cookie_value(data: dict) -> str:
+    import hashlib
+    import hmac
+    secret = str(data.get("phone_secret") or "")
+    pin = str(data.get("phone_pin") or "")
+    return hmac.new(secret.encode(), pin.encode(), hashlib.sha256).hexdigest()
+
+
+_PHONE_ALLOWED = ("/api/status", "/api/jobs", "/api/live", "/api/phone")
+
+
+@app.middleware("http")
+async def _phone_gate(request: Request, call_next):
+    """NeonClipping phone remote gate: when a phone PIN is set, non-local
+    API requests need the PIN cookie and only reach allowlisted routes.
+    Local (loopback) requests always pass. No PIN set = no gate."""
+    data = _read_settings()
+    pin = str(data.get("phone_pin") or "")
+    if pin:
+        host = (request.client.host if request.client else "") or ""
+        local = host in ("127.0.0.1", "::1", "localhost", "testclient")
+        path = request.url.path
+        if not local and path.startswith("/api/"):
+            ok_cookie = request.cookies.get("cf_phone") == _phone_cookie_value(data)
+            allowed = any(path == p or path.startswith(p + "/") for p in _PHONE_ALLOWED)
+            if not (ok_cookie and allowed):
+                return JSONResponse({"error": "phone PIN required"}, status_code=401)
+    return await call_next(request)
+
+
+@app.get("/m")
+async def phone_page():
+    return FileResponse(WEB_DIR / "mobile.html")
+
+
+@app.get("/api/phone/status")
+async def phone_status(request: Request):
+    data = _read_settings()
+    pin_set = bool(data.get("phone_pin"))
+    authed = (not pin_set) or request.cookies.get("cf_phone") == _phone_cookie_value(data)
+    return {"pin_set": pin_set, "authed": authed}
+
+
+@app.post("/api/phone/login")
+async def phone_login(payload: dict):
+    import hmac as _hmac
+    data = _read_settings()
+    pin = str(data.get("phone_pin") or "")
+    if not pin:
+        return {"ok": True, "pin_set": False}
+    if not _hmac.compare_digest(str(payload.get("pin") or ""), pin):
+        raise HTTPException(401, "wrong PIN")
+    resp = JSONResponse({"ok": True, "pin_set": True})
+    resp.set_cookie("cf_phone", _phone_cookie_value(data), httponly=True,
+                    samesite="lax", max_age=30 * 24 * 3600)
+    return resp
 
 
 def main() -> None:

@@ -48,7 +48,7 @@ DEFAULT_OPTIONS = {
     "game": None,
     "top": 0.32,
     "caption_y": 1450,
-    "watermark": {"text": None, "image": None, "position": "br", "opacity": 0.85},
+    "watermark": {"text": None, "image": None, "position": "br", "opacity": 0.85, "size": 0.18},
     "music": {"path": None, "volume": 0.15},
     "template": None,
     "quality": 1080,
@@ -68,6 +68,25 @@ DEFAULT_OPTIONS = {
     "caption_model": None,     # whisper model for per-clip captions (None = same as scan)
     "brain_mode": "auto",      # auto | llm | manual (manual = prompts for your own AI)
     "game_events": True,       # watch the game for WASTED/explosions/crashes
+    # NeonClipping / PeakCut parity additions
+    "profile": "balanced",     # moment mix: balanced | action | dialogue
+    "exclude": "",             # phrases (comma/newline) — clips containing them are dropped
+    "range_start": None,       # only clip inside this source range (seconds)
+    "range_end": None,
+    "review_first": False,     # park after finding: user picks candidates, then render
+    "hook_text": "",           # fixed hook headline for every clip (PeakCut override)
+    "description_text": "",    # fixed description for every clip (campaigns)
+    "caption_custom": {},      # custom caption appearance (font/size/colours/per/outline)
+    "hook_style": "box",       # box | neon | banner | impact
+    "cam_fx": "unsharp=5:5:0.8:5:5:0.0",  # facecam-only colour/clarity filter chain
+    "fade": False,             # fade picture+sound in/out
+    "outro_text": "",          # outro ribbon text over the last 3 s
+    "music_riser": False,      # music bed swells over the last 5 s
+    "skip_static": False,      # drop clips that are mostly a static screen (ad breaks)
+    "use_learned": True,       # apply star-rating learned weights when fitted
+    "live_judge": False,       # live: LLM judge must approve auto clips
+    "live_min_score": 80,      # live judge pass mark (0-100)
+    "live_decide": "either",   # live judge mode: both | either
 }
 
 FAST_PATH_MIN_DURATION = 600  # seconds; longer URLs use the audio-first path
@@ -175,6 +194,7 @@ def clean_options(raw: dict | None) -> dict:
     if isinstance(opts.get("watermark"), dict):
         wm.update(opts["watermark"])
     wm["opacity"] = _clamp(wm.get("opacity"), 0.0, 1.0, 0.85)
+    wm["size"] = _clamp(wm.get("size"), 0.05, 0.4, 0.18)
     if wm.get("position") not in ("tl", "tr", "bl", "br"):
         wm["position"] = "br"
     opts["watermark"] = wm
@@ -190,7 +210,9 @@ def clean_options(raw: dict | None) -> dict:
     lang = opts.get("language")
     opts["language"] = lang if isinstance(lang, str) and lang else None
     for k in ("hinglish", "use_llm", "captions", "hook_enabled",
-              "title_bar", "killcam", "game_events"):
+              "title_bar", "killcam", "game_events",
+              "review_first", "fade", "music_riser", "skip_static",
+              "use_learned", "live_judge"):
         opts[k] = bool(opts.get(k, DEFAULT_OPTIONS[k]))
     opts["min_score"] = _clamp(opts.get("min_score"), 0, 100, 0)
     opts["focus"] = str(opts.get("focus") or "")[:300]
@@ -225,6 +247,36 @@ def clean_options(raw: dict | None) -> dict:
     opts["ai_every_min"] = int(_clamp(opts.get("ai_every_min"), 1, 30, DEFAULT_OPTIONS["ai_every_min"]))
     if "live_per_hour" in opts:
         opts["live_per_hour"] = int(_clamp(opts.get("live_per_hour"), 1, 20, 4))
+    # NeonClipping / PeakCut parity options
+    if opts.get("profile") not in getattr(brain, "PROFILES", ("balanced", "action", "dialogue")):
+        opts["profile"] = "balanced"
+    opts["exclude"] = str(opts.get("exclude") or "")[:500]
+    for k in ("range_start", "range_end"):
+        v = opts.get(k)
+        try:
+            opts[k] = float(v) if v is not None and str(v) != "" else None
+        except (TypeError, ValueError):
+            opts[k] = None
+    if opts["range_start"] is not None and opts["range_end"] is not None \
+            and opts["range_end"] <= opts["range_start"]:
+        opts["range_start"] = opts["range_end"] = None
+    opts["hook_text"] = str(opts.get("hook_text") or "")[:80]
+    opts["description_text"] = str(opts.get("description_text") or "")[:2000]
+    opts["outro_text"] = str(opts.get("outro_text") or "")[:80]
+    opts["caption_custom"] = captions._clean_style_override(opts.get("caption_custom"))
+    if opts.get("hook_style") not in captions.HOOK_STYLES:
+        opts["hook_style"] = "box"
+    import re as _re
+    _fx_raw = _re.sub(r"[^A-Za-z0-9_=:. ,+\-]", "", str(opts.get("cam_fx") or ""))[:200]
+    _fx_ok = []
+    for _part in _fx_raw.split(","):
+        _part = _part.strip()
+        if _re.fullmatch(r"(eq|unsharp|hue)=[A-Za-z0-9_=:.+\- ]+", _part):
+            _fx_ok.append(_part)
+    opts["cam_fx"] = ",".join(_fx_ok)
+    opts["live_min_score"] = _clamp(opts.get("live_min_score"), 0, 100, 80)
+    if opts.get("live_decide") not in ("both", "either"):
+        opts["live_decide"] = "either"
     return opts
 
 
@@ -416,6 +468,12 @@ def _prepare_clip(clip: dict, options: dict) -> dict:
     clip.setdefault("viral_score", clip.get("score", 0))
     clip.setdefault("facecam", options.get("facecam"))
     clip.setdefault("game", options.get("game"))
+    # Fixed user overrides (PeakCut hook_text / description_text): the user's
+    # own hook and description win over the AI's on every clip.
+    if str(options.get("hook_text") or "").strip():
+        clip["hook"] = str(options["hook_text"]).strip()[:80]
+    if str(options.get("description_text") or "").strip():
+        clip["description"] = str(options["description_text"]).strip()[:2000]
     return clip
 
 
@@ -492,7 +550,18 @@ def _find_or_park(job, store, jdir, words, scan, duration, options):
         _set(job, store, status="waiting_ai", stage="waiting_ai", progress=0.65)
         _note(job, store, "manual AI mode: copy a prompt into any AI, then paste its JSON picks back here")
         return None
-    return brain.find_clips(words, scan, duration, options, report=_noop_report,
+    opts = dict(options)
+    if job.get("static_ranges"):
+        opts["static_ranges"] = job["static_ranges"]
+    if opts.get("use_learned", True):
+        try:
+            from . import learn as _learn
+            w = _learn.learned_weights(brain._WEIGHTS)
+            if w and w != brain._WEIGHTS:
+                opts["weights"] = w
+        except Exception:  # noqa: BLE001 - learning is a bonus, never a blocker
+            pass
+    return brain.find_clips(words, scan, duration, opts, report=_noop_report,
                             manual_picks=job.get("manual_picks"))
 
 
@@ -521,8 +590,8 @@ def run_job(job: dict, store: JobStore) -> None:
 
         # Resume after manual AI picks: words + scan were persisted when the
         # job parked, so ingest/transcribe/scan are skipped entirely.
-        resume = bool(job.get("manual_picks")) and (jdir / "words.json").exists() \
-            and (jdir / "scan.json").exists()
+        resume = bool(job.get("manual_picks") or job.get("review_selected")) \
+            and (jdir / "words.json").exists() and (jdir / "scan.json").exists()
         if resume:
             words = json.loads((jdir / "words.json").read_text(encoding="utf-8"))
             scan = json.loads((jdir / "scan.json").read_text(encoding="utf-8"))
@@ -537,7 +606,10 @@ def run_job(job: dict, store: JobStore) -> None:
                 if audio is None:
                     raise RuntimeError("the downloaded audio for this job is gone")
             _set(job, store, stage="finding", progress=0.65)
-            clips = _find_or_park(job, store, jdir, words, scan, duration, options)
+            if job.get("review_selected"):
+                clips = [dict(c) for c in job["review_selected"]]
+            else:
+                clips = _find_or_park(job, store, jdir, words, scan, duration, options)
         elif is_file:
             src = Path(source["path"])
             if not src.exists():
@@ -617,6 +689,15 @@ def run_job(job: dict, store: JobStore) -> None:
             chat_rate = media.chat_speed(url, meta, jdir) if not is_file else None
             scan = signals.scan(src, duration, words=words, motion_on=True,
                                 report=_noop_report, chat_rate=chat_rate, game=game)
+            if options.get("skip_static"):
+                try:
+                    from . import extras as _extras
+                    ranges = _extras.static_ranges(src, duration)
+                    if ranges:
+                        job["static_ranges"] = ranges
+                        _note(job, store, f"static-screen ranges found: {len(ranges)} (clips inside them are dropped)")
+                except Exception as e:  # noqa: BLE001 - static skip is best-effort
+                    _note(job, store, f"static-screen scan failed: {e}")
             _set(job, store, stage="finding", progress=0.65)
             clips = _find_or_park(job, store, jdir, words, scan, duration, options)
 
@@ -632,6 +713,25 @@ def run_job(job: dict, store: JobStore) -> None:
         store.save(job)
         if not clips:
             _note(job, store, "no clips were found in this video")
+
+        # Review-first (NeonClipping "Find highlights"): park with the
+        # candidates so the user picks which ones to render. Words + scan
+        # are persisted so resume skips ingest/transcribe/scan.
+        if options.get("review_first") and not job.get("_review_done") and clips:
+            try:
+                (jdir / "scan.json").write_text(json.dumps(scan, ensure_ascii=False), encoding="utf-8")
+            except (OSError, TypeError):
+                pass
+            for c in clips:
+                c["status"] = "candidate"
+            job["clips"] = clips
+            _set(job, store, status="waiting_review", stage="waiting_review", progress=0.65)
+            _note(job, store, "review the candidate moments, tick the ones you want, then press Render selected")
+            return
+
+        if job.get("cancelled"):
+            _set(job, store, status="cancelled", stage="cancelled")
+            return
 
         # ---------- per-clip source resolution (fast path downloads sections) ----------
         frame_src = src
@@ -705,6 +805,9 @@ def run_job(job: dict, store: JobStore) -> None:
         _set(job, store, stage="rendering", progress=0.7)
         n = max(1, len(clips))
         for i, clip in enumerate(clips):
+            if job.get("cancelled"):
+                _set(job, store, status="cancelled", stage="cancelled")
+                return
             _set(job, store, progress=0.7 + 0.3 * (i / n))
             name = f"clip{i + 1:02d}"
             clip["name"] = name
@@ -750,8 +853,19 @@ def run_job(job: dict, store: JobStore) -> None:
         except Exception:  # noqa: BLE001 - the sheet is a bonus export
             pass
         _set(job, store, status="done", stage="done", progress=1.0)
+        try:
+            from . import extras as _extras
+            done_n = sum(1 for c in clips if c.get("status") == "done")
+            _extras.notify("job_done", f"ClipForge: '{job.get('title') or job['id']}' finished — {done_n} clip(s) ready.")
+        except Exception:  # noqa: BLE001 - alerts are a bonus
+            pass
     except Exception as e:  # noqa: BLE001
         _set(job, store, status="error", stage="error", error=media.friendly_error(e, url or ""))
+        try:
+            from . import extras as _extras
+            _extras.notify("job_error", f"ClipForge: job '{job.get('title') or job['id']}' failed: {job.get('error') or e}")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def resume_with_picks(job: dict, store: JobStore, picks: list) -> dict:
@@ -786,20 +900,14 @@ def resume_with_picks(job: dict, store: JobStore, picks: list) -> dict:
     return job
 
 
-def rerender_clip(job: dict, store: JobStore, idx: int, new_options: dict | None) -> dict:
-    """Re-render one clip with merged options, from the stored source file.
-    The merged options become the job's options (so later re-renders inherit
-    region/layout changes). Returns the updated clip dict."""
-    clips = job.get("clips") or []
-    if idx < 0 or idx >= len(clips):
-        raise IndexError(f"clip {idx} does not exist")
-    merged = dict(job.get("options") or {})
-    if isinstance(new_options, dict):
-        merged.update(new_options)
-    options = clean_options(merged)
-    job["options"] = options
-
-    clip = clips[idx]
+def _render_one_clip(job: dict, store: JobStore, clip: dict, options: dict,
+                     facecam_override=..., game_override=...) -> dict:
+    """Render one clip dict from its stored source (shared by rerender_clip
+    and manual_clip). facecam_override/game_override: when not Ellipsis, the
+    value (rect dict or None) wins over the clip's stored rect — this is the
+    per-clip editor path. Words come from the job's words.json, or from the
+    clip's words_override (clip-relative edited/imported words) when set."""
+    jdir = job_dir(store, job)
     src_str = clip.get("src") or job.get("source_path")
     if not src_str or not Path(src_str).exists():
         raise ValueError("the source file for this clip is gone")
@@ -809,24 +917,334 @@ def rerender_clip(job: dict, store: JobStore, idx: int, new_options: dict | None
     src_w, src_h = int(pr.get("width") or 0), int(pr.get("height") or 0)
     sec_dur = float(pr.get("duration") or 0)
 
-    jdir = job_dir(store, job)
-    words_path = jdir / "words.json"
-    words = json.loads(words_path.read_text(encoding="utf-8")) if words_path.exists() else []
-    words_for_render = words if offset == 0.0 else _shift_words(words, offset, sec_dur or None)
+    rel_start = float(clip["start"]) - offset
+    rel_end = float(clip["end"]) - offset
+    override = clip.get("words_override")
+    if override:
+        words_for_render = [{"start": float(w["start"]) + rel_start,
+                             "end": float(w["end"]) + rel_start,
+                             "text": str(w["text"])} for w in override]
+    else:
+        words_path = jdir / "words.json"
+        words = json.loads(words_path.read_text(encoding="utf-8")) if words_path.exists() else []
+        words_for_render = words if offset == 0.0 else _shift_words(words, offset, sec_dur or None)
 
-    name = clip.get("name") or f"clip{idx + 1:02d}"
+    name = clip.get("name") or "clip01"
     clip["name"] = name
-    clip_for_render = dict(clip, start=float(clip["start"]) - offset, end=float(clip["end"]) - offset)
+    clip_for_render = dict(clip, start=rel_start, end=rel_end)
+    if facecam_override is not ...:
+        clip_for_render["facecam"] = facecam_override
+    if game_override is not ...:
+        clip_for_render["game"] = game_override
+    result = render.render_clip(src, jdir / "clips", name, clip_for_render,
+                                words_for_render, src_w, src_h, options)
+    clip.update(_basename_fields(result))
+    clip["status"] = "done"
+    clip["error"] = None
+    clip["facecam"] = clip_for_render.get("facecam")
+    clip["game"] = clip_for_render.get("game")
+    return clip
+
+
+def rerender_clip(job: dict, store: JobStore, idx: int, new_options: dict | None) -> dict:
+    """Re-render one clip with merged options, from the stored source file.
+
+    Default behaviour (job-level region editor): the merged options become
+    the job's options. With {"_per_clip": true} in new_options (the clip
+    editor), the merge applies to this clip only and is snapshotted on
+    clip["edit_options"].
+
+    new_options may also carry editor fields (not render options):
+      facecam / game — explicit per-clip rects (null clears) — these win
+        over the clip's stored rects.
+      start / end — trim (absolute source seconds, 3-180 s, inside source).
+      clip_fields — {title, hook, description, hashtags, highlight_words}
+        text edits applied before rendering.
+    Returns the updated clip dict."""
+    clips = job.get("clips") or []
+    if idx < 0 or idx >= len(clips):
+        raise IndexError(f"clip {idx} does not exist")
+    new_options = dict(new_options or {})
+    per_clip = bool(new_options.pop("_per_clip", False))
+    clip_fields = new_options.pop("clip_fields", None)
+    trim_start = new_options.pop("start", None)
+    trim_end = new_options.pop("end", None)
+    has_cam = "facecam" in new_options
+    has_game = "game" in new_options
+
+    clip = clips[idx]
+    if isinstance(clip_fields, dict):
+        for k in ("title", "hook", "description"):
+            if k in clip_fields:
+                clip[k] = str(clip_fields[k] or "")[:2000 if k == "description" else 200]
+        if "hashtags" in clip_fields:
+            tags = clip_fields["hashtags"]
+            if isinstance(tags, str):
+                tags = [t.strip().lstrip("#") for t in tags.replace(",", " ").split() if t.strip()]
+            clip["hashtags"] = [str(t)[:40] for t in (tags or [])][:10]
+        if "highlight_words" in clip_fields:
+            hw = clip_fields["highlight_words"]
+            if isinstance(hw, str):
+                hw = hw.replace(",", " ").split()
+            clip["highlight_words"] = [str(w)[:30] for w in (hw or [])][:12]
+
+    merged = dict((clip.get("edit_options") if per_clip else None)
+                  or job.get("options") or {})
+    merged.update(new_options)
+    options = clean_options(merged)
+    if per_clip:
+        clip["edit_options"] = options
+    else:
+        job["options"] = options
+
+    if trim_start is not None or trim_end is not None:
+        try:
+            ns = float(trim_start) if trim_start is not None else float(clip["start"])
+            ne = float(trim_end) if trim_end is not None else float(clip["end"])
+        except (TypeError, ValueError):
+            raise ValueError("trim start/end must be numbers (seconds)")
+        offset = float(clip.get("src_offset") or 0.0)
+        src_str = clip.get("src") or job.get("source_path")
+        sec_dur = 0.0
+        if src_str and Path(src_str).exists():
+            sec_dur = float(media.probe(Path(src_str)).get("duration") or 0)
+        lo = offset
+        hi = offset + sec_dur if sec_dur else float(job.get("duration") or ne)
+        ns = max(lo, min(ns, hi - 3.0))
+        ne = max(ns + 3.0, min(ne, hi))
+        if ne - ns > 180.0:
+            ne = ns + 180.0
+        clip["start"] = round(ns, 2)
+        clip["end"] = round(ne, 2)
+
+    cam_override = options.get("facecam") if has_cam else ...
+    game_override = options.get("game") if has_game else ...
     try:
-        result = render.render_clip(src, jdir / "clips", name, clip_for_render,
-                                    words_for_render, src_w, src_h, options)
-        clip.update(_basename_fields(result))
-        clip["status"] = "done"
-        clip["error"] = None
-        clip["facecam"] = options.get("facecam")
-        clip["game"] = options.get("game")
+        _render_one_clip(job, store, clip, options,
+                         facecam_override=cam_override, game_override=game_override)
     except Exception as e:  # noqa: BLE001
         clip["status"] = "error"
         clip["error"] = str(e)
     store.save(job)
+    try:
+        publish.posting_sheet(job, job_dir(store, job) / "clips")
+    except Exception:  # noqa: BLE001
+        pass
     return clip
+
+
+def resume_with_selection(job: dict, store: JobStore, indices: list) -> dict:
+    """Review-first mode: render only the candidate clips the user ticked."""
+    if job.get("status") != "waiting_review":
+        raise ValueError("this job is not waiting for a review selection")
+    clips = job.get("clips") or []
+    picked = []
+    for i in indices or []:
+        try:
+            i = int(i)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < len(clips):
+            c = dict(clips[i])
+            c["status"] = "pending"
+            picked.append(c)
+    if not picked:
+        raise ValueError("tick at least one candidate clip")
+    job["review_selected"] = picked
+    job["_review_done"] = True
+    job["status"] = "queued"
+    job["stage"] = "queued"
+    store.save(job)
+    submit(job, store)
+    return job
+
+
+def manual_clip(job: dict, store: JobStore, start: float, end: float,
+                title: str = "", hook: str = "") -> dict:
+    """Render one hand-picked range (NeonClipping manual range export /
+    PeakCut hand clip). Uses the job's stored source; on fast-path URL jobs
+    the section is downloaded on demand."""
+    try:
+        start, end = float(start), float(end)
+    except (TypeError, ValueError):
+        raise ValueError("start and end must be numbers (seconds)")
+    duration = float(job.get("duration") or 0)
+    if duration:
+        end = min(end, duration)
+    start = max(0.0, start)
+    if end - start < 3.0:
+        raise ValueError("a clip needs at least 3 seconds")
+    if end - start > 180.0:
+        end = start + 180.0
+    jdir = job_dir(store, job)
+    options = clean_options(job.get("options") or {})
+
+    words_path = jdir / "words.json"
+    words = json.loads(words_path.read_text(encoding="utf-8")) if words_path.exists() else []
+    rel = [{"start": float(w["start"]) - start, "end": float(w["end"]) - start,
+            "text": str(w["text"])} for w in words if start <= float(w["start"]) < end]
+    desc = {}
+    try:
+        desc = brain.describe(rel, fallback_title=job.get("title") or "")
+    except Exception:  # noqa: BLE001 - titles are best-effort
+        desc = {}
+    clip = _prepare_clip({
+        "start": round(start, 2), "end": round(end, 2),
+        "title": str(title or desc.get("title") or "Manual clip")[:70],
+        "hook": str(hook or desc.get("hook") or "")[:80],
+        "description": desc.get("description") or "",
+        "hashtags": desc.get("hashtags") or [],
+        "highlight_words": desc.get("highlight_words") or [],
+        "reason": "Picked by you", "kind": "other", "score": 0,
+    }, options)
+
+    existing = [c.get("name") or "" for c in (job.get("clips") or [])]
+    nums = [int(n[4:]) for n in existing if n.startswith("clip") and n[4:].isdigit()]
+    clip["name"] = f"clip{(max(nums) + 1) if nums else 1:02d}"
+
+    src_path = job.get("source_path")
+    if src_path and Path(src_path).exists():
+        clip["src"] = str(src_path)
+        clip["src_offset"] = 0.0
+    elif job.get("_fast") and (job.get("source") or {}).get("url"):
+        url = job["source"]["url"]
+        sec_start = max(0.0, start - SECTION_PAD_BEFORE)
+        section = media.download_section(url, jdir, sec_start, end + SECTION_PAD_AFTER,
+                                         height=int(options.get("quality") or 1080))
+        offset = sec_start
+        cands = sorted(jdir.glob("audio_src.*"))
+        if cands:
+            try:
+                wav16 = jdir / "audio16.wav"
+                if not wav16.exists():
+                    wav16 = media.extract_audio(cands[0], wav16)
+                sec16 = media.extract_audio(section, jdir / f"{clip['name']}_16.wav")
+                offset = float(media.find_offset(wav16, sec16, approx_start=sec_start))
+            except Exception:  # noqa: BLE001 - fall back to requested start
+                offset = sec_start
+        clip["src"] = str(section)
+        clip["src_offset"] = offset
+    else:
+        raise ValueError("the source video for this job is not available yet")
+
+    try:
+        _render_one_clip(job, store, clip, options)
+    except Exception as e:  # noqa: BLE001
+        clip["status"] = "error"
+        clip["error"] = str(e)
+    job.setdefault("clips", []).append(clip)
+    store.save(job)
+    try:
+        publish.posting_sheet(job, jdir / "clips")
+    except Exception:  # noqa: BLE001
+        pass
+    return clip
+
+
+def transcript_lines(job: dict, store: JobStore, query: str = "") -> dict:
+    """Full-source transcript as readable lines (NeonClipping transcript
+    explorer): words grouped on >0.7 s gaps / sentence ends / 12 s spans.
+    With a query, only lines containing it (plus word-level hits)."""
+    jdir = job_dir(store, job)
+    words_path = jdir / "words.json"
+    words = json.loads(words_path.read_text(encoding="utf-8")) if words_path.exists() else []
+    words = sorted(({"start": float(w["start"]), "end": float(w["end"]), "text": str(w["text"])}
+                    for w in words if str(w.get("text") or "").strip()),
+                   key=lambda w: w["start"])
+    lines = []
+    cur = []
+    for w in words:
+        if cur and (w["start"] - cur[-1]["end"] > 0.7 or w["start"] - cur[0]["start"] > 12.0
+                    or cur[-1]["text"].rstrip().endswith((".", "?", "!", "…", "।"))):
+            lines.append(cur)
+            cur = []
+        cur.append(w)
+    if cur:
+        lines.append(cur)
+    out = [{"start": round(l[0]["start"], 2), "end": round(l[-1]["end"], 2),
+            "text": " ".join(x["text"] for x in l)} for l in lines]
+    q = str(query or "").strip().lower()
+    if q:
+        out = [l for l in out if q in l["text"].lower()]
+    return {"lines": out, "words": len(words), "duration": float(job.get("duration") or 0)}
+
+
+def get_clip_words(job: dict, store: JobStore, idx: int) -> list:
+    """Clip-relative words for the word editor: the clip's override when set,
+    else the job transcript sliced to the clip."""
+    clips = job.get("clips") or []
+    if idx < 0 or idx >= len(clips):
+        raise IndexError(f"clip {idx} does not exist")
+    clip = clips[idx]
+    if clip.get("words_override"):
+        return [dict(w) for w in clip["words_override"]]
+    jdir = job_dir(store, job)
+    words_path = jdir / "words.json"
+    words = json.loads(words_path.read_text(encoding="utf-8")) if words_path.exists() else []
+    s, e = float(clip["start"]), float(clip["end"])
+    return [{"start": round(float(w["start"]) - s, 3),
+             "end": round(min(float(w["end"]), e) - s, 3),
+             "text": str(w["text"])} for w in words if s <= float(w["start"]) < e]
+
+
+def set_clip_words(job: dict, store: JobStore, idx: int, words: list) -> dict:
+    """Store edited/imported clip-relative words; the next re-render burns
+    these instead of the job transcript."""
+    clips = job.get("clips") or []
+    if idx < 0 or idx >= len(clips):
+        raise IndexError(f"clip {idx} does not exist")
+    clip = clips[idx]
+    dur = float(clip["end"]) - float(clip["start"])
+    clean = []
+    for w in words or []:
+        try:
+            s = max(0.0, float(w["start"]))
+            e = max(s, min(float(w["end"]), dur))
+            t = str(w["text"]).strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if t and s < dur:
+            clean.append({"start": round(s, 3), "end": round(e, 3), "text": t[:60]})
+    clean.sort(key=lambda w: w["start"])
+    clip["words_override"] = clean or None
+    store.save(job)
+    return clip
+
+
+def update_clip_text(job: dict, store: JobStore, idx: int, fields: dict) -> dict:
+    """Text-only edit (PeakCut /text): title/hook/description/hashtags
+    without re-rendering. Metadata JSON + POSTING.md are refreshed."""
+    clips = job.get("clips") or []
+    if idx < 0 or idx >= len(clips):
+        raise IndexError(f"clip {idx} does not exist")
+    clip = clips[idx]
+    for k in ("title", "hook", "description"):
+        if k in (fields or {}):
+            clip[k] = str(fields[k] or "")[:2000 if k == "description" else 200]
+    if "hashtags" in (fields or {}):
+        tags = fields["hashtags"]
+        if isinstance(tags, str):
+            tags = [t.strip().lstrip("#") for t in tags.replace(",", " ").split() if t.strip()]
+        clip["hashtags"] = [str(t)[:40] for t in (tags or [])][:10]
+    store.save(job)
+    try:
+        clips_dir = job_dir(store, job) / "clips"
+        if clip.get("name"):
+            publish.write_metadata(clip, clips_dir, clip["name"])
+        publish.posting_sheet(job, clips_dir)
+    except Exception:  # noqa: BLE001 - sidecars are a bonus
+        pass
+    return clip
+
+
+def cancel_job(job: dict, store: JobStore) -> dict:
+    """Cooperative cancel: the running pipeline checks this flag between
+    stages/clips and stops cleanly."""
+    if job.get("status") in ("done", "error", "cancelled"):
+        raise ValueError(f"job is already {job.get('status')}")
+    job["cancelled"] = True
+    if job.get("status") in ("queued", "waiting_ai", "waiting_review"):
+        job["status"] = "cancelled"
+        job["stage"] = "cancelled"
+    store.save(job)
+    return job

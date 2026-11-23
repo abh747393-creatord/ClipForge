@@ -21,6 +21,13 @@ KINDS = ("reaction", "skill", "funny", "reveal", "take", "tip", "story",
          "action", "opinion", "insight", "other")
 _WEIGHTS = {"loud": .12, "shout": .10, "spike": .08, "words": .16, "motion": .12,
             "cuts": .02, "chat": .06, "game": .10, "llm": .24}
+# NeonClipping curation profiles: per-feature multipliers over _WEIGHTS.
+_PROFILE_MULT = {
+    "balanced": {"llm": 2.5, "motion": .5, "loud": .7, "shout": .65, "cuts": .6, "spike": .7, "game": .7},
+    "dialogue": {"llm": 3.5, "words": 1.6, "motion": .25, "loud": .5, "shout": .45, "cuts": .4, "spike": .5, "game": .4, "chat": .7},
+    "action": {},
+}
+PROFILES = tuple(_PROFILE_MULT.keys())
 _SENT_END = (".", "?", "!", "…", "।")
 
 # Moment taxonomy (stream-clips highlights.py): what makes a moment clippable.
@@ -185,12 +192,20 @@ def _highlight_words(words_rel, limit=6):
     return [t for _wt, t in ranked[:limit]]
 
 
-def _weighted_score(features):
-    """Weighted mean over available (non-None) features ×100."""
+def _weighted_score(features, weights=None, profile="balanced"):
+    """Weighted mean over available (non-None) features ×100.
+
+    weights: optional learned weights (learn.learned_weights) replacing
+    _WEIGHTS. profile: NeonClipping moment-mix profiles — balanced favours
+    dialogue/AI judgement, action favours motion/loudness, dialogue favours
+    words/AI even more."""
+    base = dict(weights) if isinstance(weights, dict) and weights else dict(_WEIGHTS)
+    mult = _PROFILE_MULT.get(str(profile or "balanced").lower(), {})
     total_w, total = 0.0, 0.0
-    for key, w in _WEIGHTS.items():
+    for key, w in base.items():
+        w = float(w) * float(mult.get(key, 1.0))
         v = features.get(key)
-        if v is not None:
+        if v is not None and w > 0:
             total_w += w
             total += w * max(0.0, min(1.0, float(v)))
     return round(100.0 * total / total_w, 1) if total_w else 0.0
@@ -304,6 +319,21 @@ def find_clips(words, scan, duration, options, report=lambda m: None, manual_pic
     except (TypeError, ValueError):
         min_score = 0.0
     focus = str(options.get('focus') or '').strip()[:300]
+    profile = str(options.get('profile') or 'balanced').lower()
+    if profile not in _PROFILE_MULT:
+        profile = 'balanced'
+    weights = options.get('weights') if isinstance(options.get('weights'), dict) else None
+    exclude = [p.strip().lower() for p in str(options.get('exclude') or '').replace(',', '\n').splitlines()
+               if p.strip()][:20]
+    try:
+        range_start = float(options['range_start']) if options.get('range_start') is not None else None
+    except (TypeError, ValueError):
+        range_start = None
+    try:
+        range_end = float(options['range_end']) if options.get('range_end') is not None else None
+    except (TypeError, ValueError):
+        range_end = None
+    static_ranges = options.get('static_ranges') or []
     duration = float(duration or 0)
     words = words or []
 
@@ -326,7 +356,8 @@ def find_clips(words, scan, duration, options, report=lambda m: None, manual_pic
                          'kind': p.get('kind') if p.get('kind') in KINDS else 'other',
                          '_manual_score': p.get('score')})
     else:
-        pool = signals.candidates(scan, duration, count * 3, min_len, max_len)
+        pool_n = count * 6 if (range_start is not None or range_end is not None or exclude) else count * 3
+        pool = signals.candidates(scan, duration, pool_n, min_len, max_len)
     if not pool and duration > 0:
         pool = [{'start': 0.0, 'end': round(min(duration, max_len), 2), 'score': 0.0,
                  'title': 'Highlight 1', 'hook': '', 'description': '', 'hashtags': [],
@@ -350,7 +381,7 @@ def find_clips(words, scan, duration, options, report=lambda m: None, manual_pic
         c['features'] = feats
         c['_rel'] = rel
         c['_text'] = ' '.join(w['text'] for w in rel)
-        c['score'] = _weighted_score(feats)
+        c['score'] = _weighted_score(feats, weights, profile)
 
     pool.sort(key=lambda c: -c['score'])
 
@@ -385,7 +416,7 @@ def find_clips(words, scan, duration, options, report=lambda m: None, manual_pic
                 c['hook'] = hook or c.get('hook', '')
                 if title:
                     c['title'] = title
-            c['score'] = _weighted_score(c['features'])
+            c['score'] = _weighted_score(c['features'], weights, profile)
         pool.sort(key=lambda c: -c['score'])
     else:
         for c in pool:
@@ -394,6 +425,34 @@ def find_clips(words, scan, duration, options, report=lambda m: None, manual_pic
                 c['hook'] = hook or c.get('hook', '')
                 if title and not c.get('title'):
                     c['title'] = title
+
+    # User filters (NeonClipping focus/include-exclude + range import,
+    # PeakCut static-screen exclusion): drop candidates before selection.
+    if exclude or range_start is not None or range_end is not None or static_ranges:
+        def _static_frac(c):
+            dur_c = max(0.1, c['end'] - c['start'])
+            hit = 0.0
+            for rng in static_ranges:
+                try:
+                    rs, re_ = float(rng[0]), float(rng[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                hit += max(0.0, min(c['end'], re_) - max(c['start'], rs))
+            return hit / dur_c
+
+        kept_pool = []
+        for c in pool:
+            if range_start is not None and c['start'] < range_start:
+                continue
+            if range_end is not None and c['end'] > range_end:
+                continue
+            if exclude and any(p in (c.get('_text') or '').lower() for p in exclude):
+                continue
+            if static_ranges and _static_frac(c) > 0.5:
+                continue
+            kept_pool.append(c)
+        if kept_pool:
+            pool = kept_pool
 
     # De-overlap: drop a candidate when it overlaps a kept (better) one by
     # more than max(2 s, 30% of the shorter clip) — a sliver of overlap is

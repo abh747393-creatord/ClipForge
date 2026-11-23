@@ -32,7 +32,31 @@
     <section class="view" id="view-new">
       <div class="card">
         <label class="field-label" for="urlInput">Video link (YouTube / Twitch / Kick)</label>
-        <input id="urlInput" type="url" placeholder="https://www.youtube.com/watch?v=…" autocomplete="off">
+        <div class="row">
+          <input id="urlInput" type="url" placeholder="https://www.youtube.com/watch?v=…" autocomplete="off" style="flex:1">
+          <button class="btn" id="previewBtn" type="button">👁 Preview</button>
+        </div>
+        <div id="linkPreviewCard" hidden>
+          <div class="hint" id="linkInfo"></div>
+          <div class="region-wrap" id="newRegionWrap">
+            <img id="linkThumb" alt="video preview frame">
+            <div class="region-box facecam" id="boxNewFacecam" hidden>
+              <span class="region-tag">Facecam</span><i class="handle"></i>
+            </div>
+            <div class="region-box game" id="boxNewGame" hidden>
+              <span class="region-tag">Gameplay</span><i class="handle"></i>
+            </div>
+          </div>
+          <div class="row wrap">
+            <button class="btn sm" data-npreset="tl" type="button">Facecam TL</button>
+            <button class="btn sm" data-npreset="tr" type="button">TR</button>
+            <button class="btn sm" data-npreset="bl" type="button">BL</button>
+            <button class="btn sm" data-npreset="br" type="button">BR</button>
+            <button class="btn sm" data-npreset="none" type="button">None (auto)</button>
+            <button class="btn sm" id="newGameFullBtn" type="button">Gameplay = full frame</button>
+          </div>
+          <div class="hint">Drag the boxes to select the <b>facecam section</b> and the <b>gameplay section</b> yourself — they are used for every clip. Leave them off for auto-detection.</div>
+        </div>
         <div class="dropzone" id="dropzone" tabindex="0">
           <b>or upload a video</b>
           <span>click to choose, or drag &amp; drop — .mp4 .mov .mkv .webm</span>
@@ -58,6 +82,12 @@
 
       <div class="card">
         <h3>Clips</h3>
+        <div class="row wrap">
+          <label>Saved profile
+            <select id="jobProfile"><option value="">— none —</option></select>
+          </label>
+          <button class="btn sm" id="saveProfileBtn" type="button">💾 Save current settings as profile</button>
+        </div>
         <div class="grid3">
           <label>How many clips
             <input id="optCount" type="number" min="1" max="12" step="1" value="4">
@@ -67,6 +97,21 @@
           </label>
           <label>Max length (s)
             <input id="optMaxLen" type="number" min="10" max="180" step="1" value="60">
+          </label>
+        </div>
+        <div class="grid3">
+          <label>Only clip from (s, optional)
+            <input id="optRangeStart" type="number" min="0" step="1" placeholder="start">
+          </label>
+          <label>Only clip until (s, optional)
+            <input id="optRangeEnd" type="number" min="0" step="1" placeholder="end">
+          </label>
+          <label>Moment mix
+            <select id="optProfile">
+              <option value="balanced" selected>Balanced</option>
+              <option value="action">Action (motion + loud)</option>
+              <option value="dialogue">Dialogue (words + AI)</option>
+            </select>
           </label>
         </div>
         <div class="grid3">
@@ -101,10 +146,15 @@
           <label class="toggle"><input type="checkbox" id="optLlm" checked> Use AI (LLM)</label>
           <label class="toggle"><input type="checkbox" id="optHinglish"> Hinglish captions</label>
           <label class="toggle"><input type="checkbox" id="optGameEvents" checked> Watch the game (WASTED / explosions / crashes)</label>
+          <label class="toggle"><input type="checkbox" id="optReview"> Review candidates first (pick before rendering)</label>
+          <label class="toggle"><input type="checkbox" id="optSkipStatic"> Skip static screens (ad breaks / BRB)</label>
         </div>
         <div class="grid3">
           <label>Focus brief (optional)
             <input id="optFocus" type="text" placeholder="e.g. only clutch rounds &amp; funny fails">
+          </label>
+          <label>Exclude phrases (comma separated)
+            <input id="optExclude" type="text" placeholder="e.g. sponsor, subscribe">
           </label>
           <label>AI picking
             <select id="optBrainMode">
@@ -113,8 +163,16 @@
               <option value="manual">Manual — my own AI picks (prompts)</option>
             </select>
           </label>
+        </div>
+        <div class="grid3">
           <label>Minimum viral score
             <span class="slider-inline"><input type="range" id="optMinScore" min="0" max="90" step="5" value="0"><span id="minScoreVal">0 (keep all)</span></span>
+          </label>
+          <label>Fixed hook for every clip (optional)
+            <input id="optHookText" type="text" placeholder="overrides the AI hook">
+          </label>
+          <label>Fixed description (optional, campaigns)
+            <input id="optDescText" type="text" placeholder="used verbatim on every clip">
           </label>
         </div>
       </div>
@@ -145,6 +203,62 @@
           <label class="toggle"><input type="checkbox" id="optTitleBar"> Title bar (emoji headline)</label>
           <label class="toggle"><input type="checkbox" id="optKillcam"> Kill-cam replay (slow-mo peak)</label>
           <label class="toggle"><input type="checkbox" id="optMissionCard"> Mission card</label>
+          <label class="toggle"><input type="checkbox" id="optFade"> Fade in / out</label>
+          <label class="toggle"><input type="checkbox" id="optMusicRiser"> Music riser (swells at the end)</label>
+        </div>
+        <div class="grid3">
+          <label>Hook look
+            <select id="optHookStyle">
+              <option value="box" selected>Box (white card)</option>
+              <option value="neon">Neon glow</option>
+              <option value="banner">Banner bar</option>
+              <option value="impact">Impact + underline</option>
+            </select>
+          </label>
+          <label>Outro text (last 3 s, optional)
+            <input id="optOutro" type="text" placeholder="e.g. Follow for more">
+          </label>
+          <label>Music bed (optional)
+            <span class="row tight">
+              <input id="optMusicFile" type="file" accept=".mp3,.wav,.m4a,.ogg,.flac">
+              <input id="optMusicVol" type="number" min="0" max="1" step="0.05" value="0.15" title="volume 0-1" size="5">
+            </span>
+            <span class="hint" id="musicHint"></span>
+          </label>
+        </div>
+        <h4>Logo / watermark (optional — for campaigns that require one)</h4>
+        <div class="grid3">
+          <label>Logo image
+            <input id="optLogoFile" type="file" accept=".png,.jpg,.jpeg,.webp">
+            <span class="hint" id="logoHint"></span>
+          </label>
+          <label>…or watermark text
+            <input id="optWmText" type="text" placeholder="e.g. @yourhandle">
+          </label>
+          <label>Position
+            <select id="optWmPos">
+              <option value="tl">Top-left</option>
+              <option value="tr">Top-right</option>
+              <option value="bl">Bottom-left</option>
+              <option value="br" selected>Bottom-right</option>
+            </select>
+          </label>
+        </div>
+        <div class="grid3">
+          <label>Logo opacity
+            <span class="slider-inline"><input type="range" id="optWmOpacity" min="0.1" max="1" step="0.05" value="0.85"><span id="wmOpacityVal">0.85</span></span>
+          </label>
+          <label>Logo size
+            <span class="slider-inline"><input type="range" id="optWmSize" min="0.05" max="0.4" step="0.01" value="0.18"><span id="wmSizeVal">18%</span></span>
+          </label>
+          <label>Facecam look (contrast / brightness / saturation / clarity)
+            <span class="fx-row">
+              <input type="range" id="fxContrast" min="0.5" max="1.5" step="0.05" value="1" title="contrast">
+              <input type="range" id="fxBrightness" min="-0.3" max="0.3" step="0.02" value="0" title="brightness">
+              <input type="range" id="fxSaturation" min="0" max="2" step="0.05" value="1" title="saturation">
+              <input type="range" id="fxClarity" min="0" max="1.5" step="0.1" value="0.8" title="clarity (sharpen)">
+            </span>
+          </label>
         </div>
       </div>
 
@@ -170,6 +284,58 @@
         <label class="anim-label">Animation
           <select id="optAnim"></select>
         </label>
+        <div class="toggles">
+          <label class="toggle"><input type="checkbox" id="capCustomOn"> Custom caption look (font / size / colours)</label>
+        </div>
+        <div id="capCustomBox" hidden>
+          <div class="grid3">
+            <label>Font
+              <select id="capFont">
+                <option value="Poppins ExtraBold">Poppins ExtraBold</option>
+                <option value="Anton">Anton</option>
+                <option value="Archivo Black">Archivo Black</option>
+              </select>
+            </label>
+            <label>Size
+              <span class="slider-inline"><input type="range" id="capSize" min="40" max="200" step="2" value="120"><span id="capSizeVal">120</span></span>
+            </label>
+            <label>Words per caption
+              <input id="capPer" type="number" min="1" max="12" step="1" value="3">
+            </label>
+          </div>
+          <div class="grid3">
+            <label>Text colour <input id="capBase" type="color" value="#ffffff"></label>
+            <label>Spoken-word colour <input id="capActive" type="color" value="#00f0ff"></label>
+            <label>Highlight colour <input id="capStrong" type="color" value="#ffff00"></label>
+          </div>
+          <div class="grid3">
+            <label>Outline width
+              <span class="slider-inline"><input type="range" id="capOutlineW" min="0" max="20" step="1" value="7"><span id="capOutlineVal">7</span></span>
+            </label>
+            <label class="toggle"><input type="checkbox" id="capUpper" checked> UPPERCASE</label>
+            <label>Saved looks
+              <span class="row tight">
+                <select id="capLooks"><option value="">— none —</option></select>
+                <button class="btn sm" id="capSaveLook" type="button">💾 Save look</button>
+              </span>
+            </label>
+          </div>
+        </div>
+        <div class="cap-preview-wrap">
+          <div class="cap-preview-frame">
+            <img id="capPreviewImg" alt="Caption style preview">
+            <div class="cap-preview-loading" id="capPreviewLoading" hidden>rendering preview…</div>
+          </div>
+          <div class="cap-preview-ctl">
+            <label>Preview caption text
+              <input id="capPreviewText" type="text" value="THIS IS A TEST CAPTION" autocomplete="off">
+            </label>
+            <label>Preview hook text
+              <input id="capPreviewHook" type="text" value="YOUR HOOK HERE" autocomplete="off">
+            </label>
+            <div class="hint">Live preview — rendered with the same caption engine, fonts and layout as your clips, so this is exactly how the captions will look.</div>
+          </div>
+        </div>
       </div>
 
       <button class="btn primary lg" id="makeBtn">⚡ Make clips</button>
@@ -186,6 +352,7 @@
           <div class="row">
             <a class="btn sm" id="postingBtn" href="#" target="_blank" rel="noopener">📋 POSTING.md</a>
             <a class="btn sm" id="exportBtn" href="#" download>⬇ Export all (.zip)</a>
+            <button class="btn sm" id="cancelJobBtn" hidden>Cancel job</button>
             <button class="btn sm danger" id="deleteJobBtn">Delete job</button>
           </div>
         </div>
@@ -206,6 +373,15 @@
         <textarea id="aiAnswers" rows="6" placeholder='Paste the AI answer here — a JSON list like [{"start": 125, "end": 160, "title": "…", "hook": "…", "score": 85}]'></textarea>
         <div class="row">
           <button class="btn primary" id="aiSubmitBtn">Use these picks → make clips</button>
+        </div>
+      </div>
+
+      <div class="card" id="reviewPanel" hidden>
+        <h3>🔎 Review candidate moments</h3>
+        <div class="hint">Tick the moments you want rendered, then press Render selected. Nothing is rendered yet.</div>
+        <div id="reviewList"></div>
+        <div class="row">
+          <button class="btn primary" id="reviewRenderBtn">Render selected →</button>
         </div>
       </div>
 
@@ -236,8 +412,131 @@
         <div class="hint">Regions apply when you re-render. Facecam = cyan, Gameplay = lime.</div>
       </div>
 
+      <div class="card" id="transcriptCard" hidden>
+        <h3>📝 Transcript — find a moment, make a clip</h3>
+        <div class="row">
+          <input id="transcriptSearch" type="text" placeholder="Search the transcript…" autocomplete="off" style="flex:1">
+          <button class="btn sm" id="transcriptLoadBtn" type="button">Load transcript</button>
+        </div>
+        <div class="transcript-lines" id="transcriptLines"></div>
+        <div class="hint">Click a line to set the clip start · Shift+click sets the end.</div>
+        <div class="grid3">
+          <label>Clip start (s) <input id="manualStart" type="number" min="0" step="0.1"></label>
+          <label>Clip end (s) <input id="manualEnd" type="number" min="0" step="0.1"></label>
+          <label>Title (optional) <input id="manualTitle" type="text"></label>
+        </div>
+        <div class="row">
+          <button class="btn primary sm" id="manualClipBtn" type="button">✂ Make clip from this range</button>
+        </div>
+      </div>
+
       <div class="clip-grid" id="clipGrid"></div>
     </section>
+
+    <!-- ============ CLIP EDITOR (modal) ============ -->
+    <div class="modal-backdrop" id="editorModal" hidden>
+      <div class="modal">
+        <div class="row between">
+          <h3 id="edTitle">Edit clip</h3>
+          <button class="btn sm" id="edClose" type="button">✕ Close</button>
+        </div>
+        <div class="editor-grid">
+          <div class="editor-col">
+            <label class="field-label">Source frame — drag the facecam &amp; gameplay boxes</label>
+            <div class="region-wrap" id="edRegionWrap">
+              <img id="edFrameImg" alt="clip source frame">
+              <div class="region-box facecam" id="edBoxFacecam" hidden>
+                <span class="region-tag">Facecam</span><i class="handle"></i>
+              </div>
+              <div class="region-box game" id="edBoxGame" hidden>
+                <span class="region-tag">Gameplay</span><i class="handle"></i>
+              </div>
+            </div>
+            <div class="row wrap">
+              <button class="btn sm" data-epreset="tl" type="button">Facecam TL</button>
+              <button class="btn sm" data-epreset="tr" type="button">TR</button>
+              <button class="btn sm" data-epreset="bl" type="button">BL</button>
+              <button class="btn sm" data-epreset="br" type="button">BR</button>
+              <button class="btn sm" data-epreset="none" type="button">None</button>
+              <button class="btn sm" id="edGameFullBtn" type="button">Gameplay = full frame</button>
+            </div>
+            <div class="rect-inputs">
+              <span>Facecam x/y/w/h %</span>
+              <input id="edFcX" type="number" min="0" max="100" step="1"><input id="edFcY" type="number" min="0" max="100" step="1"><input id="edFcW" type="number" min="3" max="100" step="1"><input id="edFcH" type="number" min="3" max="100" step="1">
+              <span>Gameplay x/y/w/h %</span>
+              <input id="edGmX" type="number" min="0" max="100" step="1"><input id="edGmY" type="number" min="0" max="100" step="1"><input id="edGmW" type="number" min="3" max="100" step="1"><input id="edGmH" type="number" min="3" max="100" step="1">
+            </div>
+            <label class="field-label">Current clip (use it to set the trim)</label>
+            <video id="edVideo" controls preload="metadata" style="width:100%;max-height:300px;background:#000"></video>
+            <div class="grid3">
+              <label>Trim start (s in source) <input id="edStart" type="number" min="0" step="0.1"></label>
+              <label>Trim end (s in source) <input id="edEnd" type="number" min="0" step="0.1"></label>
+              <span class="row tight" style="align-self:end">
+                <button class="btn sm" id="edSetStart" type="button">Start = video time</button>
+                <button class="btn sm" id="edSetEnd" type="button">End = video time</button>
+              </span>
+            </div>
+          </div>
+          <div class="editor-col">
+            <label class="field-label">Live preview (exact render path)</label>
+            <div class="ed-preview-wrap">
+              <img id="edPreviewImg" alt="edited clip preview">
+              <div class="safe-zone" id="edSafeZone" hidden>
+                <i class="sz-top"></i><i class="sz-right"></i><i class="sz-bottom"></i>
+              </div>
+              <div class="cap-preview-loading" id="edPreviewLoading" hidden>rendering preview…</div>
+            </div>
+            <label class="toggle"><input type="checkbox" id="edSafeToggle"> Show platform safe zones</label>
+            <div class="grid3">
+              <label>Layout <select id="edLayout"></select></label>
+              <label>Caption style <select id="edStyle"></select></label>
+              <label>Animation <select id="edAnim"></select></label>
+            </div>
+            <div class="grid3">
+              <label>Hook look
+                <select id="edHookStyle">
+                  <option value="box">Box</option><option value="neon">Neon</option>
+                  <option value="banner">Banner</option><option value="impact">Impact</option>
+                </select>
+              </label>
+              <label>Face size
+                <span class="slider-inline"><input type="range" id="edTop" min="0.2" max="0.5" step="0.01" value="0.32"><span id="edTopVal">0.32</span></span>
+              </label>
+              <label>Caption height
+                <span class="slider-inline"><input type="range" id="edCapY" min="600" max="1800" step="10" value="1450"><span id="edCapYVal">1450</span></span>
+              </label>
+            </div>
+            <label>Title <input id="edClipTitle" type="text"></label>
+            <label>Hook <input id="edHook" type="text"></label>
+            <label>Description <textarea id="edDesc" rows="3"></textarea></label>
+            <div class="grid3">
+              <label>Hashtags <input id="edTags" type="text" placeholder="gta6, clutch"></label>
+              <label>Highlight words <input id="edHighlight" type="text" placeholder="words to colour"></label>
+              <span class="row tight" style="align-self:end">
+                <button class="btn sm" id="edSaveText" type="button">Save text</button>
+                <button class="btn sm" id="edWrite" type="button">🤖 AI rewrite</button>
+              </span>
+            </div>
+            <details>
+              <summary>Caption words (edit text, then Save words + Re-render)</summary>
+              <div class="ed-words" id="edWords"></div>
+              <div class="row">
+                <button class="btn sm" id="edSaveWords" type="button">Save words</button>
+                <button class="btn sm" id="edResetWords" type="button">Reset to transcript</button>
+              </div>
+              <label>…or import subtitles (SRT / VTT / ASS, times relative to clip start)
+                <textarea id="edSubs" rows="4" placeholder="Paste subtitle text here"></textarea>
+              </label>
+              <button class="btn sm" id="edImportSubs" type="button">Import subtitles</button>
+            </details>
+            <div class="row">
+              <button class="btn primary" id="edRerender" type="button">↻ Re-render this clip</button>
+              <span class="hint" id="edStatus"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- ============ LIBRARY ============ -->
     <section class="view" id="view-library" hidden>
@@ -257,10 +556,27 @@
             <input id="liveEvery" type="number" min="1" max="30" step="1" value="3">
           </label>
         </div>
+        <div class="grid3">
+          <label class="toggle"><input type="checkbox" id="liveJudge" checked> Two-judge gate (AI + reactions must agree)</label>
+          <label>Min judge score (0–10)
+            <input id="liveMinScore" type="number" min="0" max="10" step="0.5" value="6">
+          </label>
+          <label>When judges disagree
+            <select id="liveDecide">
+              <option value="either" selected>Either judge can pass</option>
+              <option value="both">Both must pass</option>
+              <option value="llm">AI judge decides</option>
+              <option value="reaction">Chat reactions decide</option>
+            </select>
+          </label>
+        </div>
         <div class="row">
           <button class="btn primary" id="liveStartBtn">● Start live clipping</button>
           <button class="btn danger" id="liveStopBtn" disabled>Stop</button>
-          <button class="btn" id="clipNowBtn" disabled>Clip last 30s</button>
+          <span class="row tight">
+            <input id="clipNowSec" type="number" min="10" max="180" step="5" value="30" title="seconds" size="4">
+            <button class="btn" id="clipNowBtn" disabled>✂ Clip now</button>
+          </span>
         </div>
       </div>
       <div class="card" id="liveStatusCard" hidden>
@@ -280,14 +596,49 @@
     <section class="view" id="view-settings" hidden>
       <div class="card">
         <h3>AI (LLM) — optional, for smarter clip picks &amp; titles</h3>
+        <label class="field-label" for="llmProvider">Provider</label>
+        <select id="llmProvider"></select>
         <label class="field-label" for="llmBase">Base URL (OpenAI-compatible)</label>
         <input id="llmBase" type="url" placeholder="http://127.0.0.1:11434/v1">
         <label class="field-label" for="llmModel">Model</label>
-        <input id="llmModel" type="text" placeholder="llama3.2:3b">
+        <span class="row tight">
+          <input id="llmModel" type="text" placeholder="llama3.2:3b" style="flex:1">
+          <button class="btn sm" id="llmModelsBtn" type="button">🔎 Find models</button>
+          <button class="btn sm" id="llmTestBtn" type="button">Test</button>
+        </span>
+        <div class="hint" id="llmTestOut"></div>
         <label class="field-label" for="llmKey">API key</label>
         <input id="llmKey" type="password" placeholder="API key" autocomplete="off">
         <div class="hint">Leave the key empty to keep the saved one. The key is stored on this machine only and never shown again.</div>
         <button class="btn primary" id="saveSettingsBtn">Save settings</button>
+      </div>
+
+      <div class="card">
+        <h3>🔔 Alerts &amp; phone remote</h3>
+        <label class="field-label" for="discordWebhook">Discord webhook (optional)</label>
+        <input id="discordWebhook" type="url" placeholder="https://discord.com/api/webhooks/…" autocomplete="off">
+        <div class="grid3">
+          <label>Telegram bot token <input id="telegramToken" type="password" autocomplete="off"></label>
+          <label>Telegram chat ID <input id="telegramChat" type="text" autocomplete="off"></label>
+          <label>Phone PIN (4–8 digits, blank = off) <input id="phonePin" type="text" inputmode="numeric" autocomplete="off"></label>
+        </div>
+        <label class="toggle"><input type="checkbox" id="autoRecord"> Auto-record watchlist channels when they go live</label>
+        <div class="hint">With a PIN set, phones on your LAN open <b>/m</b> to control live sessions. Without a PIN, only this computer can use the API.</div>
+        <button class="btn primary" id="saveAlertsBtn">Save alerts</button>
+      </div>
+
+      <div class="card">
+        <h3>🩺 System</h3>
+        <div id="readinessList" class="readiness-list"></div>
+        <div class="row wrap">
+          <button class="btn sm" id="readinessBtn" type="button">Re-check</button>
+          <button class="btn sm" id="updateBtn" type="button">Check for updates</button>
+          <span class="hint" id="updateOut"></span>
+          <a class="btn sm" href="/api/diagnostics" download="clipforge-diagnostics.txt">⬇ Diagnostics</a>
+        </div>
+        <div class="hint" id="storageInfo"></div>
+        <h4>Saved profiles &amp; looks</h4>
+        <div id="profilesList"></div>
       </div>
       <div class="card">
         <h3>Watchlist — creators to check when finding streams</h3>

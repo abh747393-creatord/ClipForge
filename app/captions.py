@@ -174,10 +174,16 @@ def group_words(words, per, max_chars=18, gap=0.45):
     return out
 
 
-def _hook_events(hook, dur, y, width, height):
+def _hook_events(hook, dur, y, width, height, hook_style="box", accent="00F0FF"):
     """The heading: dark text in a white rounded box that fits it, on one line
     or two balanced ones. Ported from PeakCut's _hook_events, scaled to the
-    output frame (authored at 1080x1920)."""
+    output frame (authored at 1080x1920).
+
+    hook_style (NeonClipping's 4 heading looks):
+      box    — white rounded box, dark text (default, PeakCut look)
+      neon   — no box; glowing accent-coloured text
+      banner — full-width accent bar, dark text
+      impact — big white text with thick outline + accent underline"""
     sx, sy = width / 1080.0, height / 1920.0
     f = _Font.get(HOOK["font"])
     size = max(24, int(round(HOOK["size"] * sy)))
@@ -201,11 +207,36 @@ def _hook_events(hook, dur, y, width, height):
     r = min(HOOK["radius"] * sx, bh / 2)
     x1, y1 = x0 + bw, y0 + bh
     n = lambda v: f"{v:.0f}"  # noqa: E731
+    span = f"{_ts(0)},{_ts(dur)}"
+    ev = []
+    if hook_style == "banner":
+        bar = f"m 0 {n(y0)} l {width} {n(y0)} l {width} {n(y1)} l 0 {n(y1)}"
+        ev.append(f"Dialogue: 3,{span},Hook,,0,0,0,,{{\\an7\\pos(0,0)\\fad(160,0)\\c&H{accent}&\\p1}}{bar}{{\\p0}}")
+        for i, line in enumerate(lines):
+            cy = y - line_h * (len(lines) - 1) / 2 + i * line_h - f.cap_shift(size)
+            ev.append(f"Dialogue: 4,{span},Hook,,0,0,0,,{{\\an5\\pos({width // 2},{cy:.0f})\\fad(160,0)\\fs{size}\\c&H{HOOK['ink']}&}}{line}")
+        return ev
+    if hook_style == "neon":
+        for i, line in enumerate(lines):
+            cy = y - line_h * (len(lines) - 1) / 2 + i * line_h - f.cap_shift(size)
+            ev.append(f"Dialogue: 4,{span},Hook,,0,0,0,,{{\\an5\\pos({width // 2},{cy:.0f})\\fad(160,0)\\fs{size}"
+                      f"\\c&H{accent}&\\bord3\\3c&H{accent}&\\blur2\\shad0}}{line}")
+        return ev
+    if hook_style == "impact":
+        for i, line in enumerate(lines):
+            cy = y - line_h * (len(lines) - 1) / 2 + i * line_h - f.cap_shift(size)
+            ev.append(f"Dialogue: 4,{span},Hook,,0,0,0,,{{\\an5\\pos({width // 2},{cy:.0f})\\fad(160,0)\\fs{size}"
+                      f"\\c&HFFFFFF&\\bord6\\3c&H000000&}}{line}")
+        uy = y + line_h * len(lines) / 2 + 10 * sy
+        uw = widest * 0.7
+        ux0, ux1 = (width - uw) / 2, (width + uw) / 2
+        under = f"m {n(ux0)} {n(uy)} l {n(ux1)} {n(uy)} l {n(ux1)} {n(uy + 10 * sy)} l {n(ux0)} {n(uy + 10 * sy)}"
+        ev.append(f"Dialogue: 3,{span},Hook,,0,0,0,,{{\\an7\\pos(0,0)\\fad(160,0)\\c&H{accent}&\\p1}}{under}{{\\p0}}")
+        return ev
     box = (f"m {n(x0 + r)} {n(y0)} l {n(x1 - r)} {n(y0)} b {n(x1)} {n(y0)} {n(x1)} {n(y0)} {n(x1)} {n(y0 + r)} "
            f"l {n(x1)} {n(y1 - r)} b {n(x1)} {n(y1)} {n(x1)} {n(y1)} {n(x1 - r)} {n(y1)} "
            f"l {n(x0 + r)} {n(y1)} b {n(x0)} {n(y1)} {n(x0)} {n(y1)} {n(x0)} {n(y1 - r)} "
            f"l {n(x0)} {n(y0 + r)} b {n(x0)} {n(y0)} {n(x0)} {n(y0)} {n(x0 + r)} {n(y0)}")
-    span = f"{_ts(0)},{_ts(dur)}"
     ev = [f"Dialogue: 3,{span},Hook,,0,0,0,,{{\\an7\\pos(0,0)\\fad(160,0)\\c&H{HOOK['box']}&\\p1}}{box}{{\\p0}}"]
     for i, line in enumerate(lines):
         cy = y - line_h * (len(lines) - 1) / 2 + i * line_h - f.cap_shift(size)
@@ -213,8 +244,47 @@ def _hook_events(hook, dur, y, width, height):
     return ev
 
 
+HOOK_STYLES = ("box", "neon", "banner", "impact")
+
+
+def _clean_style_override(override):
+    """Validated custom-caption overrides (NeonClipping brands.appearance):
+    font/size/base/active/strong/outline/per/upper. Unknown/invalid dropped."""
+    out = {}
+    if not isinstance(override, dict):
+        return out
+    if override.get("font") in FONT_FILES:
+        out["font"] = override["font"]
+    try:
+        size = int(float(override.get("size")))
+        if 24 <= size <= 220:
+            out["size"] = size
+    except (TypeError, ValueError):
+        pass
+    for k in ("base", "active", "strong"):
+        v = str(override.get(k) or "").lstrip("#").upper()
+        if re.fullmatch(r"[0-9A-F]{6}", v):
+            out[k] = v
+    try:
+        outline = int(float(override.get("outline")))
+        if 0 <= outline <= 20:
+            out["outline"] = outline
+    except (TypeError, ValueError):
+        pass
+    try:
+        per = int(float(override.get("per")))
+        if 1 <= per <= 12:
+            out["per"] = per
+    except (TypeError, ValueError):
+        pass
+    if "upper" in override:
+        out["upper"] = bool(override["upper"])
+    return out
+
+
 def build_ass(words_rel, dur, hook, style_name, anim, highlight_words, hook_y, cap_y,
-              width=1080, height=1920, hook_enabled=True):
+              width=1080, height=1920, hook_enabled=True, style_override=None,
+              hook_style="box"):
     """A complete ASS document for one clip.
 
     words_rel are relative to clip start; dur is the clip length in seconds.
@@ -222,8 +292,13 @@ def build_ass(words_rel, dur, hook, style_name, anim, highlight_words, hook_y, c
     Animations: highlight (all words visible, spoken word highlighted),
     pop_in (words appear as spoken, with a pop), one_by_one (only the spoken
     word, centred), build_up (words accumulate), full_line (static line).
+    style_override: custom caption appearance merged over the named style.
+    hook_style: box | neon | banner | impact (see _hook_events).
     """
-    st = STYLES.get(style_name, STYLES["bounce"])
+    st = dict(STYLES.get(style_name, STYLES["bounce"]))
+    st.update(_clean_style_override(style_override))
+    if hook_style not in HOOK_STYLES:
+        hook_style = "box"
     if anim not in ANIMS:
         anim = "highlight"
     dur = max(0.0, float(dur or 0.0))
@@ -253,7 +328,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     ev = []
     hook_text = _clean(hook or "")
     if hook_enabled and hook_text:
-        ev.extend(_hook_events(hook_text, dur, hook_y_s, width, height))
+        ev.extend(_hook_events(hook_text, dur, hook_y_s, width, height,
+                               hook_style=hook_style, accent=st["active"]))
     f = _Font.get(st["font"])
     inside = []
     for w in (words_rel or []):

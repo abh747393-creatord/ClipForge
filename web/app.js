@@ -8,6 +8,9 @@ const state = {
   presetFacecam: null,
   currentJobId: null, currentJob: null,
   regions: { facecam: null, game: null },
+  newRegions: { facecam: null, game: null },
+  editor: { jobId: null, idx: -1, clip: null, regions: { facecam: null, game: null }, words: [], previewTimer: null, previewSeq: 0, previewUrl: null },
+  logoPath: null, musicPath: null,
   liveId: null,
   jobTimer: null, liveTimer: null,
   uploadFile: null,
@@ -82,9 +85,30 @@ const PRESETS = {
 };
 
 /* ---------------- options ---------------- */
+function captionCustom() {
+  if (!$("capCustomOn").checked) return null;
+  return {
+    font: $("capFont").value,
+    size: parseInt($("capSize").value, 10) || 120,
+    base: $("capBase").value,
+    active: $("capActive").value,
+    strong: $("capStrong").value,
+    outline: parseInt($("capOutlineW").value, 10) || 7,
+    per: parseInt($("capPer").value, 10) || 3,
+    upper: $("capUpper").checked,
+  };
+}
+function camFxString() {
+  const c = parseFloat($("fxContrast").value), b = parseFloat($("fxBrightness").value),
+    s = parseFloat($("fxSaturation").value), cl = parseFloat($("fxClarity").value);
+  if (c === 1 && b === 0 && s === 1 && cl === 0.8) return null;  // defaults = no FX
+  return "eq=contrast=" + c + ":brightness=" + b + ":saturation=" + s + ",unsharp=5:5:" + cl + ":5:5:0";
+}
 function collectOptions() {
   const lang = $("optLanguage").value;
   const stars = $("optStars").value;
+  const rangeStart = parseFloat($("optRangeStart").value);
+  const rangeEnd = parseFloat($("optRangeEnd").value);
   return {
     count: parseInt($("optCount").value, 10) || 4,
     min_len: parseInt($("optMinLen").value, 10) || 15,
@@ -99,8 +123,8 @@ function collectOptions() {
     use_llm: $("optLlm").checked,
     captions: $("optCaptions").checked,
     hook_enabled: $("optHook").checked,
-    facecam: state.presetFacecam,
-    game: null,
+    facecam: state.newRegions.facecam || state.presetFacecam,
+    game: state.newRegions.game,
     game_events: $("optGameEvents").checked,
     focus: $("optFocus").value.trim(),
     brain_mode: $("optBrainMode").value,
@@ -116,6 +140,28 @@ function collectOptions() {
       handle: $("optCampaignHandle").value.trim(),
       tag: $("optCampaignTag").value.trim() || "#ad",
     },
+    profile: $("optProfile").value || "balanced",
+    exclude: $("optExclude").value.trim(),
+    range_start: isNaN(rangeStart) ? null : rangeStart,
+    range_end: isNaN(rangeEnd) ? null : rangeEnd,
+    review_first: $("optReview").checked,
+    skip_static: $("optSkipStatic").checked,
+    hook_text: $("optHookText").value.trim(),
+    description_text: $("optDescText").value.trim(),
+    caption_custom: captionCustom(),
+    hook_style: $("optHookStyle").value || "box",
+    cam_fx: camFxString(),
+    fade: $("optFade").checked,
+    outro_text: $("optOutro").value.trim(),
+    music_riser: $("optMusicRiser").checked,
+    music: state.musicPath ? { path: state.musicPath, volume: parseFloat($("optMusicVol").value) || 0.15 } : null,
+    watermark: {
+      text: $("optWmText").value.trim(),
+      image: state.logoPath,
+      position: $("optWmPos").value,
+      opacity: parseFloat($("optWmOpacity").value) || 0.85,
+      size: parseFloat($("optWmSize").value) || 0.18,
+    },
   };
 }
 function liveOptions() {
@@ -123,6 +169,9 @@ function liveOptions() {
   o.layout = $("liveLayout").value || o.layout;
   o.style = $("liveStyle").value || o.style;
   o.ai_every_min = parseInt($("liveEvery").value, 10) || 3;
+  o.live_judge = $("liveJudge").checked;
+  o.live_min_score = parseFloat($("liveMinScore").value) || 6;
+  o.live_decide = $("liveDecide").value || "either";
   return o;
 }
 
@@ -204,6 +253,7 @@ async function loadCatalogs() {
   fillSelect($("liveLayout"), state.layouts.map((l) => [l.id, l.label || l.id]), state.layout);
   fillSelect($("liveStyle"), state.styles.map((s) => [s.id, s.label || s.id]), state.style);
   updatePresetRow();
+  refreshCapPreview();
 }
 function fillSelect(sel, pairs, value) {
   sel.innerHTML = "";
@@ -218,10 +268,69 @@ function selectLayout(id) {
   state.layout = id;
   document.querySelectorAll(".layout-card").forEach((c) => c.classList.toggle("on", c.dataset.layout === id));
   updatePresetRow();
+  scheduleCapPreview();
 }
 function selectStyle(id) {
   state.style = id;
   document.querySelectorAll(".style-chip").forEach((c) => c.classList.toggle("on", c.dataset.style === id));
+  scheduleCapPreview();
+}
+
+/* ---------------- caption preview ----------------
+   One still frame from POST /api/caption-preview, rendered server-side
+   through the same caption engine as a real clip. */
+let capPreviewTimer = null;
+let capPreviewSeq = 0;
+let capPreviewUrl = null;
+const ASPECT_RATIOS = { vertical: "9/16", square: "1/1", portrait: "4/5", landscape: "16/9" };
+function scheduleCapPreview() {
+  clearTimeout(capPreviewTimer);
+  capPreviewTimer = setTimeout(refreshCapPreview, 350);
+}
+async function fetchPreviewBlob(body) {
+  const res = await fetch("/api/caption-preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let msg = "preview failed (" + res.status + ")";
+    try { const d = await res.json(); if (d && d.error) msg = d.error; } catch (e) { /* keep default */ }
+    throw new Error(msg);
+  }
+  return URL.createObjectURL(await res.blob());
+}
+async function refreshCapPreview() {
+  const img = $("capPreviewImg");
+  const loading = $("capPreviewLoading");
+  if (!img) return;
+  const seq = ++capPreviewSeq;
+  const aspect = $("optAspect").value;
+  const frame = img.parentElement;
+  if (frame) frame.style.aspectRatio = ASPECT_RATIOS[aspect] || "9/16";
+  loading.hidden = false;
+  loading.textContent = "rendering preview…";
+  try {
+    const url = await fetchPreviewBlob({
+      style: state.style,
+      anim: $("optAnim").value || "highlight",
+      layout: state.layout,
+      aspect: aspect,
+      text: $("capPreviewText").value,
+      hook: $("capPreviewHook").value,
+      captions: $("optCaptions").checked,
+      hook_enabled: $("optHook").checked,
+      caption_custom: captionCustom(),
+      hook_style: $("optHookStyle").value || "box",
+    });
+    if (seq !== capPreviewSeq) { URL.revokeObjectURL(url); return; }  // a newer preview won
+    if (capPreviewUrl) URL.revokeObjectURL(capPreviewUrl);
+    capPreviewUrl = url;
+    img.src = url;
+    loading.hidden = true;
+  } catch (e) {
+    if (seq === capPreviewSeq) loading.textContent = "preview failed — " + e.message;
+  }
 }
 function updatePresetRow() {
   $("presetRow").hidden = !needsCam(state.layout);
@@ -231,6 +340,147 @@ function updatePresetRow() {
 function setUploadFile(f) {
   state.uploadFile = f || null;
   $("dzFile").textContent = f ? f.name : "";
+  if (f) grabUploadFrame(f);
+}
+
+/* Link preview: title/duration/thumbnail + drag-select the facecam &
+   gameplay sections BEFORE making clips (NeonClipping-style). */
+async function previewLink() {
+  const url = $("urlInput").value.trim();
+  if (!url) { toast("Paste a video link first."); return; }
+  const btn = $("previewBtn");
+  btn.disabled = true;
+  $("linkInfo").textContent = "fetching preview…";
+  $("linkPreviewCard").hidden = false;
+  try {
+    const p = await postJSON("/api/preview", { url: url });
+    const bits = [];
+    if (p.title) bits.push(p.title);
+    if (p.uploader) bits.push(p.uploader);
+    if (p.duration) bits.push(fmtTime(p.duration));
+    if (p.is_live) bits.push("🔴 LIVE");
+    $("linkInfo").textContent = bits.join(" · ") || "preview ready";
+    const img = $("linkThumb");
+    if (p.thumbnail) { img.src = p.thumbnail; img.hidden = false; }
+    else { img.hidden = true; }
+  } catch (e) {
+    $("linkInfo").textContent = "preview failed — " + e.message + " (you can still make clips)";
+  }
+  btn.disabled = false;
+}
+function grabUploadFrame(file) {
+  // Show a frame from the uploaded file so regions can be picked pre-job.
+  const url = URL.createObjectURL(file);
+  const v = document.createElement("video");
+  v.muted = true;
+  v.preload = "metadata";
+  v.src = url;
+  v.addEventListener("loadedmetadata", () => {
+    v.currentTime = Math.min(5, (v.duration || 10) * 0.1);
+  });
+  v.addEventListener("seeked", () => {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = v.videoWidth || 960;
+      canvas.height = v.videoHeight || 540;
+      canvas.getContext("2d").drawImage(v, 0, 0);
+      const img = $("linkThumb");
+      img.src = canvas.toDataURL("image/jpeg", 0.8);
+      img.hidden = false;
+      $("linkPreviewCard").hidden = false;
+      $("linkInfo").textContent = file.name + " · " + fmtTime(v.duration || 0) + " — drag the sections if you want";
+    } catch (e) { /* frame grab is best-effort */ }
+    URL.revokeObjectURL(url);
+  });
+  v.addEventListener("error", () => URL.revokeObjectURL(url));
+}
+async function uploadAsset(file, hintId, kind) {
+  const hint = $(hintId);
+  hint.textContent = "uploading…";
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await api("/api/upload-asset", { method: "POST", body: fd });
+    hint.textContent = "✓ " + file.name;
+    if (kind === "logo") state.logoPath = r.path; else state.musicPath = r.path;
+    toast((kind === "logo" ? "Logo" : "Music") + " uploaded.", true);
+  } catch (e) {
+    hint.textContent = "upload failed";
+    toast(e.message);
+  }
+}
+
+/* ---------------- profiles & caption looks ---------------- */
+async function loadProfiles() {
+  let profiles = [];
+  try { profiles = await api("/api/profiles"); } catch (e) { return; }
+  const jobs = profiles.filter((p) => !p.name.startsWith("look: "));
+  const looks = profiles.filter((p) => p.name.startsWith("look: "));
+  fillSelect($("jobProfile"), [["", "— none —"]].concat(jobs.map((p) => [p.name, p.name])), "");
+  fillSelect($("capLooks"), [["", "— none —"]].concat(looks.map((p) => [p.name, p.name.slice(6)])), "");
+  const list = $("profilesList");
+  if (list) {
+    list.innerHTML = "";
+    for (const p of profiles) {
+      const row = document.createElement("div");
+      row.className = "lib-row";
+      row.innerHTML = '<div class="lib-main"><div class="lib-title">' + esc(p.name) + '</div><div class="lib-sub">' + esc(fmtDate(p.created)) + "</div></div>" +
+        '<button class="btn sm danger">Delete</button>';
+      row.querySelector("button").addEventListener("click", async () => {
+        try { await api("/api/profiles/" + encodeURIComponent(p.name), { method: "DELETE" }); loadProfiles(); }
+        catch (e) { toast(e.message); }
+      });
+      list.appendChild(row);
+    }
+    if (!profiles.length) list.innerHTML = '<div class="hint">No saved profiles yet.</div>';
+  }
+  return profiles;
+}
+function applyCaptionCustom(cc) {
+  $("capCustomOn").checked = !!cc;
+  $("capCustomBox").hidden = !cc;
+  if (!cc) return;
+  if (cc.font) $("capFont").value = cc.font;
+  if (cc.size) { $("capSize").value = cc.size; $("capSizeVal").textContent = cc.size; }
+  if (cc.base) $("capBase").value = cc.base;
+  if (cc.active) $("capActive").value = cc.active;
+  if (cc.strong) $("capStrong").value = cc.strong;
+  if (cc.outline != null) { $("capOutlineW").value = cc.outline; $("capOutlineVal").textContent = cc.outline; }
+  if (cc.per) $("capPer").value = cc.per;
+  $("capUpper").checked = cc.upper !== false;
+}
+function applyProfileOptions(opts) {
+  if (!opts) return;
+  if (opts.layout) selectLayout(opts.layout);
+  if (opts.style) selectStyle(opts.style);
+  if (opts.anim) $("optAnim").value = opts.anim;
+  if (opts.aspect) $("optAspect").value = opts.aspect;
+  if (opts.quality) $("optQuality").value = opts.quality;
+  if (opts.count) $("optCount").value = opts.count;
+  if (opts.min_len) $("optMinLen").value = opts.min_len;
+  if (opts.max_len) $("optMaxLen").value = opts.max_len;
+  $("optCaptions").checked = opts.captions !== false;
+  $("optHook").checked = opts.hook_enabled !== false;
+  $("optLlm").checked = opts.use_llm !== false;
+  $("optHinglish").checked = !!opts.hinglish;
+  $("optGameEvents").checked = opts.game_events !== false;
+  $("optReview").checked = !!opts.review_first;
+  $("optSkipStatic").checked = !!opts.skip_static;
+  $("optFade").checked = !!opts.fade;
+  $("optMusicRiser").checked = !!opts.music_riser;
+  $("optTitleBar").checked = !!opts.title_bar;
+  $("optKillcam").checked = !!opts.killcam;
+  if (opts.focus) $("optFocus").value = opts.focus;
+  if (opts.exclude) $("optExclude").value = opts.exclude;
+  if (opts.hook_text) $("optHookText").value = opts.hook_text;
+  if (opts.description_text) $("optDescText").value = opts.description_text;
+  if (opts.outro_text) $("optOutro").value = opts.outro_text;
+  if (opts.hook_style) $("optHookStyle").value = opts.hook_style;
+  if (opts.profile) $("optProfile").value = opts.profile;
+  if (opts.facecam) { state.newRegions.facecam = opts.facecam; placeBox($("boxNewFacecam"), opts.facecam); }
+  if (opts.game) { state.newRegions.game = opts.game; placeBox($("boxNewGame"), opts.game); }
+  applyCaptionCustom(opts.caption_custom || null);
+  scheduleCapPreview();
 }
 async function makeClips() {
   const btn = $("makeBtn");
@@ -276,7 +526,7 @@ async function refreshJob() {
   const job = await api("/api/jobs/" + state.currentJobId);
   state.currentJob = job;
   renderJob(job);
-  if (job.status === "done" || job.status === "error" || job.status === "waiting_ai") stopJobPolling();
+  if (["done", "error", "waiting_ai", "waiting_review", "cancelled"].includes(job.status)) stopJobPolling();
 }
 function renderJob(job) {
   $("jobTitle").textContent = job.title || (job.source && job.source.name) || "Job";
@@ -350,6 +600,31 @@ function renderJob(job) {
   const grid = $("clipGrid");
   grid.innerHTML = "";
   (job.clips || []).forEach((clip, i) => grid.appendChild(clipCard(job, clip, i)));
+
+  // cancel button only while the job is still running
+  $("cancelJobBtn").hidden = !["queued", "running", "waiting_review", "waiting_ai"].includes(job.status);
+
+  // review-first: candidate moments to tick before rendering
+  const review = job.status === "waiting_review";
+  $("reviewPanel").hidden = !review;
+  if (review) {
+    const list = $("reviewList");
+    list.innerHTML = "";
+    (job.candidates || []).forEach((c, i) => {
+      const row = document.createElement("label");
+      row.className = "review-row";
+      row.innerHTML = '<input type="checkbox" class="review-check" value="' + i + '" checked>' +
+        '<span class="review-main"><b>' + esc(c.title || ("Moment " + (i + 1))) + "</b> " +
+        '<span class="hint">' + fmtTime(c.start) + "–" + fmtTime(c.end) +
+        (c.score != null ? " · ⚡" + Math.round(c.score) : "") + "</span>" +
+        (c.hook ? '<div class="clip-hook">' + esc(c.hook) + "</div>" : "") +
+        (c.why ? '<div class="hint">' + esc(c.why) + "</div>" : "") + "</span>";
+      list.appendChild(row);
+    });
+  }
+
+  // transcript + manual clip maker once a transcript exists
+  $("transcriptCard").hidden = !(job.transcript_from && job.transcript_from !== "none" && job.status !== "running");
 }
 function syncRegionBoxes(job) {
   const opts = job.options || {};
@@ -407,13 +682,29 @@ function clipCard(job, clip, i) {
   }
   const dls = [["MP4", clip.file], ["SRT", clip.srt], ["VTT", clip.vtt], ["ASS", clip.ass], ["Cover", clip.cover], ["Check", clip.check], ["JSON", clip.meta]];
   html += '<div class="dl-row">' + dls.filter((d) => d[1]).map((d) => '<a class="btn" href="' + media(d[1]) + '" download>' + d[0] + "</a>").join("") + "</div>";
-  html += '<div class="clip-ctl"><select class="clip-layout"></select><select class="clip-style"></select><button class="btn sm clip-rerender">Re-render</button></div>';
+  html += '<div class="clip-ctl"><select class="clip-layout"></select><select class="clip-style"></select>'
+    + '<span class="clip-btns"><button class="btn sm clip-preview-btn" title="Preview captions on this job\'s frame">👁 Preview</button>'
+    + '<button class="btn sm clip-edit-btn">✎ Edit</button>'
+    + '<button class="btn sm clip-rerender">Re-render</button></span></div>';
+  html += '<div class="stars" title="Rate this clip — ClipForge learns what you like">' +
+    [1, 2, 3, 4, 5].map((n) => '<button type="button" class="star' + ((clip.rating || 0) >= n ? " on" : "") + '" data-star="' + n + '">★</button>').join("") + "</div>";
+  html += '<img class="clip-preview" alt="caption preview" hidden>';
   card.innerHTML = html;
 
   const layoutSel = card.querySelector(".clip-layout");
   const styleSel = card.querySelector(".clip-style");
   fillSelect(layoutSel, state.layouts.map((l) => [l.id, l.label || l.id]), clip.layout || (job.options && job.options.layout) || state.layout);
   fillSelect(styleSel, state.styles.map((s) => [s.id, s.label || s.id]), (job.options && job.options.style) || state.style);
+  card.querySelector(".clip-edit-btn").addEventListener("click", () => openEditor(job, clip, i));
+  card.querySelectorAll(".star").forEach((b) => b.addEventListener("click", async () => {
+    const n = parseInt(b.dataset.star, 10);
+    try {
+      await postJSON("/api/jobs/" + job.id + "/clips/" + i + "/rating", { rating: n });
+      clip.rating = n;
+      card.querySelectorAll(".star").forEach((s) => s.classList.toggle("on", parseInt(s.dataset.star, 10) <= n));
+      toast("Rated " + n + "★ — thanks, ClipForge learns from this.", true);
+    } catch (e) { toast(e.message); }
+  }));
   card.querySelector(".clip-rerender").addEventListener("click", async (ev) => {
     ev.target.disabled = true;
     try {
@@ -429,15 +720,44 @@ function clipCard(job, clip, i) {
     } catch (e) { toast(e.message); }
     ev.target.disabled = false;
   });
+  card.querySelector(".clip-preview-btn").addEventListener("click", async (ev) => {
+    const img = card.querySelector(".clip-preview");
+    if (!img.hidden) { img.hidden = true; return; }  // second click hides it
+    ev.target.disabled = true;
+    try {
+      const url = await fetchPreviewBlob({
+        job_id: job.id,
+        style: styleSel.value,
+        anim: (job.options && job.options.anim) || "highlight",
+        layout: layoutSel.value,
+        aspect: (job.options && job.options.aspect) || "vertical",
+        text: $("capPreviewText").value,
+        hook: clip.hook || $("capPreviewHook").value,
+        captions: true,
+        hook_enabled: !!(job.options && job.options.hook_enabled !== false),
+        facecam: state.regions.facecam, game: state.regions.game,
+        top: parseFloat($("topSlider").value),
+      });
+      if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
+      img.dataset.url = url;
+      img.src = url;
+      img.hidden = false;
+    } catch (e) { toast(e.message); }
+    ev.target.disabled = false;
+  });
   return card;
 }
 
 /* ---------------- region editor interactions ---------------- */
-function makeDraggable(box, key) {
+function makeDraggable(box, key, wrapId, store, onChange) {
+  wrapId = wrapId || "regionWrap";
+  store = store || state.regions;
   let drag = null;
   box.addEventListener("pointerdown", (ev) => {
-    const wrap = $("regionWrap").getBoundingClientRect();
-    const rect = state.regions[key];
+    const wrapEl = $(wrapId);
+    if (!wrapEl) return;
+    const wrap = wrapEl.getBoundingClientRect();
+    const rect = store[key];
     if (!rect) return;
     const resizing = ev.target.classList.contains("handle");
     drag = { resizing: resizing, startX: ev.clientX, startY: ev.clientY, rect: Object.assign({}, rect), wrap: wrap };
@@ -456,8 +776,9 @@ function makeDraggable(box, key) {
       r.x = Math.max(0, Math.min(1 - r.w, r.x + dx));
       r.y = Math.max(0, Math.min(1 - r.h, r.y + dy));
     }
-    state.regions[key] = r;
+    store[key] = r;
     placeBox(box, r);
+    if (onChange) onChange();
   });
   box.addEventListener("pointerup", () => { drag = null; });
   box.addEventListener("pointercancel", () => { drag = null; });
@@ -477,6 +798,216 @@ async function rerenderAll() {
     await refreshJob();
   } catch (e) { toast(e.message); }
   btn.disabled = false;
+}
+
+/* ---------------- post-generation clip editor ---------------- */
+function openEditor(job, clip, idx) {
+  const ed = state.editor;
+  ed.jobId = job.id; ed.idx = idx; ed.clip = clip;
+  const eo = clip.edit_options || {};
+  const opts = Object.assign({}, job.options || {}, eo);
+  ed.regions = {
+    facecam: clip.facecam ? Object.assign({}, clip.facecam) : (opts.facecam ? Object.assign({}, opts.facecam) : null),
+    game: clip.game ? Object.assign({}, clip.game) : (opts.game ? Object.assign({}, opts.game) : null),
+  };
+  $("editorModal").hidden = false;
+  $("edTitle").textContent = "Edit clip " + (idx + 1) + " — " + (clip.title || "");
+  $("edStatus").textContent = "";
+  // source frame: the clip's own moment frame (created by the preview call),
+  // fall back to the job frame
+  const img = $("edFrameImg");
+  const name = (clip.file || "").replace(/\.[^.]+$/, "");
+  img.src = "/media/" + job.id + "/" + encodeURIComponent(name + "_edit.jpg");
+  img.onerror = () => { img.onerror = null; img.src = "/media/" + job.id + "/frame.jpg"; };
+  img.onload = () => { placeBox($("edBoxFacecam"), ed.regions.facecam); placeBox($("edBoxGame"), ed.regions.game); };
+  syncEditorRectInputs();
+  fillSelect($("edLayout"), state.layouts.map((l) => [l.id, l.label || l.id]), clip.layout || opts.layout || state.layout);
+  fillSelect($("edStyle"), state.styles.map((s) => [s.id, s.label || s.id]), opts.style || state.style);
+  fillSelect($("edAnim"), state.anims.map((a) => [a, a]), opts.anim || "highlight");
+  $("edHookStyle").value = opts.hook_style || "box";
+  $("edTop").value = opts.top || 0.32;
+  $("edTopVal").textContent = Number($("edTop").value).toFixed(2);
+  $("edCapY").value = opts.caption_y || 1450;
+  $("edCapYVal").textContent = $("edCapY").value;
+  $("edClipTitle").value = clip.title || "";
+  $("edHook").value = clip.hook || "";
+  $("edDesc").value = clip.description || "";
+  $("edTags").value = (clip.hashtags || []).join(", ");
+  $("edHighlight").value = (opts.highlight_words || []).join(", ");
+  $("edStart").value = clip.start != null ? Number(clip.start).toFixed(1) : "";
+  $("edEnd").value = clip.end != null ? Number(clip.end).toFixed(1) : "";
+  const v = $("edVideo");
+  v.src = clip.file ? "/media/" + job.id + "/" + encodeURIComponent(baseName(clip.file)) : "";
+  loadEditorWords();
+  editorPreview();
+}
+function closeEditor() {
+  $("editorModal").hidden = true;
+  const v = $("edVideo");
+  v.pause(); v.removeAttribute("src"); v.load();
+}
+function syncEditorRectInputs() {
+  const set = (prefix, r) => {
+    $(prefix + "X").value = r ? Math.round(r.x * 100) : "";
+    $(prefix + "Y").value = r ? Math.round(r.y * 100) : "";
+    $(prefix + "W").value = r ? Math.round(r.w * 100) : "";
+    $(prefix + "H").value = r ? Math.round(r.h * 100) : "";
+  };
+  set("edFc", state.editor.regions.facecam);
+  set("edGm", state.editor.regions.game);
+}
+function readEditorRectInputs() {
+  const get = (prefix) => {
+    const x = parseFloat($(prefix + "X").value), y = parseFloat($(prefix + "Y").value),
+      w = parseFloat($(prefix + "W").value), h = parseFloat($(prefix + "H").value);
+    if ([x, y, w, h].some((n) => isNaN(n))) return null;
+    return { x: x / 100, y: y / 100, w: w / 100, h: h / 100 };
+  };
+  state.editor.regions.facecam = get("edFc");
+  state.editor.regions.game = get("edGm");
+  placeBox($("edBoxFacecam"), state.editor.regions.facecam);
+  placeBox($("edBoxGame"), state.editor.regions.game);
+}
+function scheduleEditorPreview() {
+  clearTimeout(state.editor.previewTimer);
+  state.editor.previewTimer = setTimeout(editorPreview, 350);
+}
+async function editorPreview() {
+  const ed = state.editor;
+  if (!ed.jobId || $("editorModal").hidden) return;
+  const seq = ++ed.previewSeq;
+  const loading = $("edPreviewLoading");
+  loading.hidden = false;
+  loading.textContent = "rendering preview…";
+  const job = state.currentJob || {};
+  try {
+    const url = await fetchPreviewBlob({
+      job_id: ed.jobId,
+      clip_idx: ed.idx,
+      style: $("edStyle").value,
+      anim: $("edAnim").value || "highlight",
+      layout: $("edLayout").value,
+      aspect: (job.options && job.options.aspect) || "vertical",
+      text: $("capPreviewText").value,
+      hook: $("edHook").value,
+      captions: true,
+      hook_enabled: true,
+      facecam: ed.regions.facecam,
+      game: ed.regions.game,
+      top: parseFloat($("edTop").value),
+      caption_y: parseInt($("edCapY").value, 10),
+      caption_custom: (ed.clip && ed.clip.edit_options && ed.clip.edit_options.caption_custom) ||
+        (job.options && job.options.caption_custom) || captionCustom(),
+      hook_style: $("edHookStyle").value,
+    });
+    if (seq !== ed.previewSeq) { URL.revokeObjectURL(url); return; }
+    if (ed.previewUrl) URL.revokeObjectURL(ed.previewUrl);
+    ed.previewUrl = url;
+    $("edPreviewImg").src = url;
+    loading.hidden = true;
+    // the preview call also wrote the clip's source frame — show it for dragging
+    const name = ((ed.clip && ed.clip.file) || "").replace(/\.[^.]+$/, "");
+    const img = $("edFrameImg");
+    const src = "/media/" + ed.jobId + "/" + encodeURIComponent(name + "_edit.jpg") + "?v=" + seq;
+    img.onerror = () => { img.onerror = null; };
+    img.onload = () => { placeBox($("edBoxFacecam"), ed.regions.facecam); placeBox($("edBoxGame"), ed.regions.game); };
+    img.src = src;
+  } catch (e) {
+    if (seq === ed.previewSeq) loading.textContent = "preview failed — " + e.message;
+  }
+}
+async function loadEditorWords() {
+  const ed = state.editor;
+  const box = $("edWords");
+  box.innerHTML = '<div class="hint">loading words…</div>';
+  try {
+    const r = await api("/api/jobs/" + ed.jobId + "/clips/" + ed.idx + "/words");
+    ed.words = r.words || [];
+    box.innerHTML = "";
+    ed.words.forEach((w, i) => {
+      const row = document.createElement("span");
+      row.className = "ed-word";
+      row.innerHTML = '<input type="text" value="' + esc(w.word) + '" data-i="' + i + '"><small>' + fmtTime(w.start) + "</small>";
+      box.appendChild(row);
+    });
+    if (!ed.words.length) box.innerHTML = '<div class="hint">No caption words for this clip.</div>';
+    box.querySelectorAll("input").forEach((inp) => inp.addEventListener("input", () => {
+      ed.words[parseInt(inp.dataset.i, 10)].word = inp.value;
+    }));
+  } catch (e) {
+    box.innerHTML = '<div class="hint">words unavailable: ' + esc(e.message) + "</div>";
+  }
+}
+async function editorRerender() {
+  const ed = state.editor;
+  const btn = $("edRerender");
+  btn.disabled = true;
+  $("edStatus").textContent = "re-rendering…";
+  try {
+    const options = {
+      _per_clip: true,
+      layout: $("edLayout").value,
+      style: $("edStyle").value,
+      anim: $("edAnim").value,
+      hook_style: $("edHookStyle").value,
+      top: parseFloat($("edTop").value),
+      caption_y: parseInt($("edCapY").value, 10),
+      facecam: ed.regions.facecam,
+      game: ed.regions.game,
+      caption_custom: (ed.clip && ed.clip.edit_options && ed.clip.edit_options.caption_custom) ||
+        (state.currentJob && state.currentJob.options && state.currentJob.options.caption_custom) || captionCustom(),
+      highlight_words: $("edHighlight").value.split(",").map((s) => s.trim()).filter(Boolean),
+      clip_fields: {
+        title: $("edClipTitle").value,
+        hook: $("edHook").value,
+        description: $("edDesc").value,
+        hashtags: $("edTags").value.split(",").map((s) => s.trim()).filter(Boolean),
+      },
+    };
+    const start = parseFloat($("edStart").value), end = parseFloat($("edEnd").value);
+    if (!isNaN(start)) options.start = start;
+    if (!isNaN(end)) options.end = end;
+    await postJSON("/api/jobs/" + ed.jobId + "/clips/" + ed.idx + "/rerender", { options: options });
+    $("edStatus").textContent = "re-rendered ✓";
+    toast("Clip re-rendered with your edits.", true);
+    await refreshJob();
+    const job = state.currentJob;
+    if (job && job.clips && job.clips[ed.idx]) {
+      ed.clip = job.clips[ed.idx];
+      const v = $("edVideo");
+      v.src = "/media/" + ed.jobId + "/" + encodeURIComponent(baseName(ed.clip.file)) + "?v=" + Date.now();
+    }
+    editorPreview();
+  } catch (e) {
+    $("edStatus").textContent = "failed: " + e.message;
+    toast(e.message);
+  }
+  btn.disabled = false;
+}
+
+/* ---------------- transcript & manual clips ---------------- */
+async function loadTranscript() {
+  if (!state.currentJobId) return;
+  const q = $("transcriptSearch").value.trim();
+  const box = $("transcriptLines");
+  box.innerHTML = '<div class="hint">loading…</div>';
+  try {
+    const r = await api("/api/jobs/" + state.currentJobId + "/transcript" + (q ? "?q=" + encodeURIComponent(q) : ""));
+    box.innerHTML = "";
+    (r.lines || []).forEach((ln) => {
+      const div = document.createElement("div");
+      div.className = "transcript-line";
+      div.innerHTML = '<span class="tl-time">' + fmtTime(ln.start) + "</span> " + esc(ln.text);
+      div.addEventListener("click", (ev) => {
+        if (ev.shiftKey) { $("manualEnd").value = Number(ln.end).toFixed(1); }
+        else { $("manualStart").value = Number(ln.start).toFixed(1); if (!$("manualEnd").value) $("manualEnd").value = Number(ln.end + 15).toFixed(1); }
+        box.querySelectorAll(".transcript-line").forEach((d) => d.classList.remove("on"));
+        div.classList.add("on");
+      });
+      box.appendChild(div);
+    });
+    if (!(r.lines || []).length) box.innerHTML = '<div class="hint">No lines match.</div>';
+  } catch (e) { box.innerHTML = '<div class="hint">' + esc(e.message) + "</div>"; }
 }
 
 /* ---------------- library ---------------- */
@@ -557,6 +1088,7 @@ function renderLive(s) {
     html += '<div class="clip-top"><div class="clip-title">' + esc(clip.title || ("Live clip " + (i + 1))) + "</div></div>";
     if (clip.hook) html += '<div class="clip-hook">' + esc(clip.hook) + "</div>";
     if (clip.kind) html += '<div class="clip-reason">trigger: ' + esc(clip.kind) + "</div>";
+    if (clip.verdict) html += '<div class="clip-reason">judge: ' + esc(clip.verdict) + (clip.judge_score != null ? " (" + esc(clip.judge_score) + "/10)" : "") + "</div>";
     const dls = [["MP4", clip.file], ["SRT", clip.srt], ["VTT", clip.vtt], ["ASS", clip.ass], ["Cover", clip.cover], ["JSON", clip.meta]];
     html += '<div class="dl-row">' + dls.filter((d) => d[1]).map((d) => '<a class="btn" href="' + media(d[1]) + '" download>' + d[0] + "</a>").join("") + "</div>";
     card.innerHTML = html;
@@ -626,10 +1158,35 @@ async function loadSettings() {
   $("llmModel").value = llm.model || "";
   $("llmKey").value = "";
   $("llmKey").placeholder = llm.has_key ? "•••• (saved)" : "API key";
+  $("discordWebhook").value = s.discord_webhook || "";
+  $("telegramToken").value = "";
+  $("telegramToken").placeholder = s.telegram_token_set ? "•••• (saved)" : "bot token";
+  $("telegramChat").value = s.telegram_chat_id || "";
+  $("phonePin").value = "";
+  $("phonePin").placeholder = s.phone_pin_set ? "•••• (saved — blank keeps it)" : "4–8 digits";
+  $("autoRecord").checked = !!s.auto_record;
+  try {
+    const providers = await api("/api/llm/providers");
+    fillSelect($("llmProvider"), (providers || []).map((p) => [p.id, p.label]), "");
+    const match = (providers || []).find((p) => p.base_url && llm.base_url && llm.base_url.startsWith(p.base_url));
+    if (match) $("llmProvider").value = match.id;
+    state.providers = providers;
+  } catch (e) { /* providers are optional */ }
   try {
     const w = await api("/api/watchlist");
     $("watchlistText").value = (w && w.text) || "";
   } catch (e) { /* watchlist is optional */ }
+  loadReadiness().catch(() => {});
+  loadProfiles().catch(() => {});
+}
+async function loadReadiness() {
+  const r = await api("/api/readiness");
+  const list = $("readinessList");
+  list.innerHTML = (r.checks || []).map((c) =>
+    '<div class="readiness-row"><span class="dot ' + (c.ok ? "ok" : "bad") + '"></span><b>' + esc(c.name) + "</b><span>" + esc(c.detail || "") + "</span></div>"
+  ).join("");
+  const st = await api("/api/storage");
+  $("storageInfo").textContent = "Storage: " + (st.human || "") + " used by " + (st.jobs || 0) + " jobs · " + (st.disk_free_human || "") + " free on disk";
 }
 async function saveWatchlist() {
   try {
@@ -651,6 +1208,20 @@ async function saveSettings() {
     toast("Settings saved.", true);
     loadSettings().catch(() => {});
     loadStatus().catch(() => {});
+  } catch (e) { toast(e.message); }
+}
+async function saveAlerts() {
+  try {
+    const body = {
+      discord_webhook: $("discordWebhook").value.trim(),
+      telegram_chat_id: $("telegramChat").value.trim(),
+      auto_record: $("autoRecord").checked,
+    };
+    if ($("telegramToken").value) body.telegram_token = $("telegramToken").value;
+    if ($("phonePin").value) body.phone_pin = $("phonePin").value.trim();
+    await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    toast("Alerts saved.", true);
+    loadSettings().catch(() => {});
   } catch (e) { toast(e.message); }
 }
 
@@ -717,9 +1288,10 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("clipNowBtn").addEventListener("click", async () => {
     if (!state.liveId) return;
+    const secs = parseInt($("clipNowSec").value, 10) || 30;
     try {
-      renderLive(await postJSON("/api/live/" + state.liveId + "/clip-now", { seconds: 30 }));
-      toast("Clipping the last 30 seconds…", true);
+      renderLive(await postJSON("/api/live/" + state.liveId + "/clip-now", { seconds: secs }));
+      toast("Clipping the last " + secs + " seconds…", true);
     } catch (e) { toast(e.message); }
   });
   $("saveSettingsBtn").addEventListener("click", saveSettings);
@@ -731,7 +1303,242 @@ document.addEventListener("DOMContentLoaded", () => {
     const v = parseInt($("optMinScore").value, 10) || 0;
     $("minScoreVal").textContent = v === 0 ? "0 (keep all)" : String(v);
   });
+  // Caption preview follows every knob that changes how captions look.
+  $("optAnim").addEventListener("change", scheduleCapPreview);
+  $("optAspect").addEventListener("change", scheduleCapPreview);
+  $("optCaptions").addEventListener("change", scheduleCapPreview);
+  $("optHook").addEventListener("change", scheduleCapPreview);
+  $("capPreviewText").addEventListener("input", scheduleCapPreview);
+  $("capPreviewHook").addEventListener("input", scheduleCapPreview);
+
+  /* ---- new: link preview + pre-job regions ---- */
+  $("previewBtn").addEventListener("click", previewLink);
+  makeDraggable($("boxNewFacecam"), "facecam", "newRegionWrap", state.newRegions);
+  makeDraggable($("boxNewGame"), "game", "newRegionWrap", state.newRegions);
+  document.querySelectorAll("[data-npreset]").forEach((b) => b.addEventListener("click", () => {
+    const p = b.dataset.npreset;
+    state.newRegions.facecam = p === "none" ? null : Object.assign({}, PRESETS[p]);
+    placeBox($("boxNewFacecam"), state.newRegions.facecam);
+  }));
+  $("newGameFullBtn").addEventListener("click", () => {
+    state.newRegions.game = { x: 0, y: 0, w: 1, h: 1 };
+    placeBox($("boxNewGame"), state.newRegions.game);
+  });
+
+  /* ---- new: custom caption look ---- */
+  $("capCustomOn").addEventListener("change", () => {
+    $("capCustomBox").hidden = !$("capCustomOn").checked;
+    scheduleCapPreview();
+  });
+  ["capFont", "capPer", "capUpper"].forEach((id) => $(id).addEventListener("change", scheduleCapPreview));
+  ["capSize", "capBase", "capActive", "capStrong", "capOutlineW"].forEach((id) => $(id).addEventListener("input", scheduleCapPreview));
+  $("capSize").addEventListener("input", () => { $("capSizeVal").textContent = $("capSize").value; });
+  $("capOutlineW").addEventListener("input", () => { $("capOutlineVal").textContent = $("capOutlineW").value; });
+  $("optHookStyle").addEventListener("change", scheduleCapPreview);
+  $("capSaveLook").addEventListener("click", async () => {
+    const name = prompt("Name this caption look:", "My look");
+    if (!name) return;
+    try {
+      await postJSON("/api/profiles", {
+        name: "look: " + name,
+        options: { style: state.style, anim: $("optAnim").value, caption_custom: captionCustom(), hook_style: $("optHookStyle").value },
+      });
+      toast("Caption look saved.", true);
+      loadProfiles();
+    } catch (e) { toast(e.message); }
+  });
+  $("capLooks").addEventListener("change", async () => {
+    const name = $("capLooks").value;
+    if (!name) return;
+    try {
+      const profiles = await api("/api/profiles");
+      const p = (profiles || []).find((x) => x.name === name);
+      if (p) {
+        if (p.options.style) selectStyle(p.options.style);
+        if (p.options.anim) $("optAnim").value = p.options.anim;
+        if (p.options.hook_style) $("optHookStyle").value = p.options.hook_style;
+        applyCaptionCustom(p.options.caption_custom || null);
+        scheduleCapPreview();
+      }
+    } catch (e) { toast(e.message); }
+  });
+
+  /* ---- new: assets, profiles ---- */
+  $("optLogoFile").addEventListener("change", () => { const f = $("optLogoFile").files[0]; if (f) uploadAsset(f, "logoHint", "logo"); });
+  $("optMusicFile").addEventListener("change", () => { const f = $("optMusicFile").files[0]; if (f) uploadAsset(f, "musicHint", "music"); });
+  $("optWmOpacity").addEventListener("input", () => { $("wmOpacityVal").textContent = Number($("optWmOpacity").value).toFixed(2); });
+  $("optWmSize").addEventListener("input", () => { $("wmSizeVal").textContent = Math.round(parseFloat($("optWmSize").value) * 100) + "%"; });
+  $("saveProfileBtn").addEventListener("click", async () => {
+    const name = prompt("Profile name:", "My profile");
+    if (!name) return;
+    try {
+      await postJSON("/api/profiles", { name: name, options: collectOptions() });
+      toast("Profile saved.", true);
+      loadProfiles();
+    } catch (e) { toast(e.message); }
+  });
+  $("jobProfile").addEventListener("change", async () => {
+    const name = $("jobProfile").value;
+    if (!name) return;
+    try {
+      const profiles = await api("/api/profiles");
+      const p = (profiles || []).find((x) => x.name === name);
+      if (p) { applyProfileOptions(p.options); toast("Profile applied.", true); }
+    } catch (e) { toast(e.message); }
+  });
+
+  /* ---- new: job actions (cancel, review, transcript, manual clip) ---- */
+  $("cancelJobBtn").addEventListener("click", async () => {
+    if (!state.currentJobId || !confirm("Cancel this job?")) return;
+    try { await postJSON("/api/jobs/" + state.currentJobId + "/cancel", {}); toast("Job cancelled."); refreshJob(); }
+    catch (e) { toast(e.message); }
+  });
+  $("reviewRenderBtn").addEventListener("click", async () => {
+    const picked = Array.from(document.querySelectorAll(".review-check:checked")).map((c) => parseInt(c.value, 10));
+    if (!picked.length) { toast("Tick at least one moment."); return; }
+    try {
+      await postJSON("/api/jobs/" + state.currentJobId + "/review-select", { indices: picked });
+      toast("Rendering your picks…", true);
+      startJobPolling();
+      refreshJob();
+    } catch (e) { toast(e.message); }
+  });
+  $("transcriptLoadBtn").addEventListener("click", loadTranscript);
+  $("transcriptSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") loadTranscript(); });
+  $("manualClipBtn").addEventListener("click", async () => {
+    const start = parseFloat($("manualStart").value), end = parseFloat($("manualEnd").value);
+    if (isNaN(start) || isNaN(end) || end <= start) { toast("Set a valid start and end first."); return; }
+    try {
+      await postJSON("/api/jobs/" + state.currentJobId + "/manual-clip", { start: start, end: end, title: $("manualTitle").value.trim() });
+      toast("Manual clip rendered.", true);
+      refreshJob();
+    } catch (e) { toast(e.message); }
+  });
+
+  /* ---- new: clip editor ---- */
+  makeDraggable($("edBoxFacecam"), "facecam", "edRegionWrap", state.editor.regions, () => { syncEditorRectInputs(); scheduleEditorPreview(); });
+  makeDraggable($("edBoxGame"), "game", "edRegionWrap", state.editor.regions, () => { syncEditorRectInputs(); scheduleEditorPreview(); });
+  document.querySelectorAll("[data-epreset]").forEach((b) => b.addEventListener("click", () => {
+    const p = b.dataset.epreset;
+    state.editor.regions.facecam = p === "none" ? null : Object.assign({}, PRESETS[p]);
+    placeBox($("edBoxFacecam"), state.editor.regions.facecam);
+    syncEditorRectInputs(); scheduleEditorPreview();
+  }));
+  $("edGameFullBtn").addEventListener("click", () => {
+    state.editor.regions.game = { x: 0, y: 0, w: 1, h: 1 };
+    placeBox($("edBoxGame"), state.editor.regions.game);
+    syncEditorRectInputs(); scheduleEditorPreview();
+  });
+  ["edFcX", "edFcY", "edFcW", "edFcH", "edGmX", "edGmY", "edGmW", "edGmH"].forEach((id) =>
+    $(id).addEventListener("change", () => { readEditorRectInputs(); scheduleEditorPreview(); }));
+  ["edLayout", "edStyle", "edAnim", "edHookStyle"].forEach((id) => $(id).addEventListener("change", scheduleEditorPreview));
+  $("edTop").addEventListener("input", () => { $("edTopVal").textContent = Number($("edTop").value).toFixed(2); scheduleEditorPreview(); });
+  $("edCapY").addEventListener("input", () => { $("edCapYVal").textContent = $("edCapY").value; scheduleEditorPreview(); });
+  $("edHook").addEventListener("input", scheduleEditorPreview);
+  $("edSafeToggle").addEventListener("change", () => { $("edSafeZone").hidden = !$("edSafeToggle").checked; });
+  $("edClose").addEventListener("click", closeEditor);
+  $("editorModal").addEventListener("click", (ev) => { if (ev.target === $("editorModal")) closeEditor(); });
+  $("edRerender").addEventListener("click", editorRerender);
+  $("edSetStart").addEventListener("click", () => {
+    const ed = state.editor, v = $("edVideo");
+    if (ed.clip && ed.clip.start != null) $("edStart").value = (Number(ed.clip.start) + v.currentTime).toFixed(1);
+  });
+  $("edSetEnd").addEventListener("click", () => {
+    const ed = state.editor, v = $("edVideo");
+    if (ed.clip && ed.clip.start != null) $("edEnd").value = (Number(ed.clip.start) + v.currentTime).toFixed(1);
+  });
+  $("edSaveText").addEventListener("click", async () => {
+    const ed = state.editor;
+    try {
+      await api("/api/jobs/" + ed.jobId + "/clips/" + ed.idx + "/text", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: $("edClipTitle").value, hook: $("edHook").value, description: $("edDesc").value, hashtags: $("edTags").value.split(",").map((s) => s.trim()).filter(Boolean) }),
+      });
+      toast("Text saved.", true);
+      refreshJob();
+    } catch (e) { toast(e.message); }
+  });
+  $("edWrite").addEventListener("click", async () => {
+    const ed = state.editor;
+    try {
+      const r = await postJSON("/api/jobs/" + ed.jobId + "/clips/" + ed.idx + "/write", {});
+      if (r.title) $("edClipTitle").value = r.title;
+      if (r.hook) $("edHook").value = r.hook;
+      if (r.description) $("edDesc").value = r.description;
+      if (r.hashtags) $("edTags").value = (r.hashtags || []).join(", ");
+      toast("AI text ready — check it, then Save text or Re-render.", true);
+      scheduleEditorPreview();
+    } catch (e) { toast(e.message); }
+  });
+  $("edSaveWords").addEventListener("click", async () => {
+    const ed = state.editor;
+    try {
+      await postJSON("/api/jobs/" + ed.jobId + "/clips/" + ed.idx + "/words", { words: ed.words });
+      toast("Words saved — Re-render to burn them in.", true);
+    } catch (e) { toast(e.message); }
+  });
+  $("edResetWords").addEventListener("click", async () => {
+    const ed = state.editor;
+    try {
+      await postJSON("/api/jobs/" + ed.jobId + "/clips/" + ed.idx + "/words", { words: [] });
+      toast("Words reset to the transcript.", true);
+      loadEditorWords();
+    } catch (e) { toast(e.message); }
+  });
+  $("edImportSubs").addEventListener("click", async () => {
+    const ed = state.editor;
+    const text = $("edSubs").value.trim();
+    if (!text) { toast("Paste subtitle text first."); return; }
+    try {
+      const r = await postJSON("/api/jobs/" + ed.jobId + "/clips/" + ed.idx + "/subtitles", { text: text });
+      toast("Imported " + r.words + " words — Re-render to burn them in.", true);
+      loadEditorWords();
+    } catch (e) { toast(e.message); }
+  });
+
+  /* ---- new: settings extras ---- */
+  $("saveAlertsBtn").addEventListener("click", saveAlerts);
+  $("llmProvider").addEventListener("change", () => {
+    const p = (state.providers || []).find((x) => x.id === $("llmProvider").value);
+    if (p && p.base_url) $("llmBase").value = p.base_url;
+    if (p && p.model_hint && !$("llmModel").value) $("llmModel").value = p.model_hint;
+  });
+  $("llmModelsBtn").addEventListener("click", async () => {
+    $("llmTestOut").textContent = "asking the endpoint for models…";
+    try {
+      const r = await postJSON("/api/llm/models", { base_url: $("llmBase").value.trim(), key: $("llmKey").value });
+      if (r.ok && r.models && r.models.length) {
+        const sel = document.createElement("select");
+        sel.id = "llmModelSel";
+        r.models.forEach((m) => { const o = document.createElement("option"); o.value = m; o.textContent = m; sel.appendChild(o); });
+        sel.value = $("llmModel").value || r.models[0];
+        $("llmModel").value = sel.value;
+        sel.addEventListener("change", () => { $("llmModel").value = sel.value; });
+        const old = $("llmModelSel"); if (old) old.replaceWith(sel); else $("llmTestOut").after(sel);
+        $("llmTestOut").textContent = r.models.length + " model(s) found — pick one, then Save settings.";
+      } else {
+        $("llmTestOut").textContent = "no models: " + (r.error || "endpoint returned none");
+      }
+    } catch (e) { $("llmTestOut").textContent = e.message; }
+  });
+  $("llmTestBtn").addEventListener("click", async () => {
+    $("llmTestOut").textContent = "testing…";
+    try {
+      const r = await postJSON("/api/llm/test", { base_url: $("llmBase").value.trim(), model: $("llmModel").value.trim(), key: $("llmKey").value });
+      $("llmTestOut").textContent = r.ok ? "✓ works — replied: " + (r.reply || "").slice(0, 80) : "✗ " + (r.error || "failed");
+    } catch (e) { $("llmTestOut").textContent = e.message; }
+  });
+  $("readinessBtn").addEventListener("click", () => loadReadiness().catch((e) => toast(e.message)));
+  $("updateBtn").addEventListener("click", async () => {
+    $("updateOut").textContent = "checking…";
+    try {
+      const r = await api("/api/update-check");
+      $("updateOut").textContent = r.update_available ? "update available: v" + r.latest + " (you have v" + r.local + ")" :
+        (r.error ? "couldn't check (" + r.error + ")" : "up to date (v" + r.local + ")");
+    } catch (e) { $("updateOut").textContent = e.message; }
+  });
 
   loadStatus().catch(() => {});
   loadCatalogs().catch((e) => toast("Could not load layouts/styles: " + e.message));
+  loadProfiles().catch(() => {});
 });

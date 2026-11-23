@@ -267,7 +267,9 @@ def render_clip(src, out_dir, name, clip, words_abs, src_w, src_h, options):
         str(options.get("anim") or "highlight"),
         clip.get("highlight_words") or [],
         pos["hook_y"], pos["caption_y"], width, height,
-        hook_enabled=hook_enabled and not use_title_bar)
+        hook_enabled=hook_enabled and not use_title_bar,
+        style_override=options.get("caption_custom") or None,
+        hook_style=str(options.get("hook_style") or "box"))
 
     # Work in a short temp dir with relative names (long paths break the
     # ffmpeg ass filter on Windows; a drive colon would break its syntax).
@@ -371,7 +373,12 @@ def render_clip(src, out_dir, name, clip, words_abs, src_w, src_h, options):
             cur = "wmt"
         if wm_idx is not None:
             op = _opacity(wm.get("opacity"), 0.7)
-            wm_w = max(32, round(width * 0.18) // 2 * 2)
+            try:
+                wm_size = float(wm.get("size") or 0.18)
+            except (TypeError, ValueError):
+                wm_size = 0.18
+            wm_size = max(0.05, min(0.4, wm_size))
+            wm_w = max(32, round(width * wm_size) // 2 * 2)
             wx, wy = _wm_xy(wm.get("position"), width, height, text=False)
             parts.append(f"[{wm_idx}:v]scale={wm_w}:-2,format=rgba,colorchannelmixer=aa={op:.2f}[wmimg]")
             parts.append(f"[{cur}][wmimg]overlay={wx}:{wy}[wmi]")
@@ -407,7 +414,24 @@ def render_clip(src, out_dir, name, clip, words_abs, src_w, src_h, options):
                 f":fontcolor=white:borderw=2:bordercolor=black:x=(w-text_w)/2:y={max(12, round(24 * height / 1920))}"
                 f":box=1:boxcolor=black@0.45:boxborderw=10[cmp]")
             cur = "cmp"
-        parts.append(f"[{cur}]ass={name}.ass:fontsdir=f[v]")
+        outro_text = " ".join(str(options.get("outro_text") or "").split())[:80]
+        if outro_text:
+            # Outro ribbon (NeonClipping styling): text bar over the last seconds.
+            (work / "outro.txt").write_text(outro_text, encoding="utf-8")
+            ofs = max(20, round(48 * height / 1920))
+            o_start = max(0.0, dur - 3.0)
+            parts.append(
+                f"[{cur}]drawtext=fontfile=f/Poppins-ExtraBold.ttf:textfile=outro.txt:fontsize={ofs}"
+                f":fontcolor=white:borderw=2:bordercolor=black:x=(w-text_w)/2:y=h-{round(150 * height / 1920)}"
+                f":box=1:boxcolor=black@0.55:boxborderw=12:enable='gte(t,{o_start:.2f})'[outro]")
+            cur = "outro"
+        use_fade = bool(options.get("fade"))
+        if use_fade:
+            parts.append(f"[{cur}]ass={name}.ass:fontsdir=f[vpre]")
+            fade_out_st = max(0.0, dur - 0.3)
+            parts.append(f"[vpre]fade=t=in:st=0:d=0.25,fade=t=out:st={fade_out_st:.2f}:d=0.3[v]")
+        else:
+            parts.append(f"[{cur}]ass={name}.ass:fontsdir=f[v]")
 
         # 6. Audio: loudnorm; optional music bed mixed under the voice.
         if music_idx is not None:
@@ -416,13 +440,26 @@ def render_clip(src, out_dir, name, clip, words_abs, src_w, src_h, options):
             except (TypeError, ValueError):
                 vol = 0.15
             parts.append(f"[{voice_idx}:a]loudnorm=I=-14:TP=-1.5:LRA=11[voice]")
-            parts.append(f"[{music_idx}:a]volume={vol:.3f}[mus]")
+            if options.get("music_riser"):
+                # Music riser (NeonClipping): bed swells over the last 5 s.
+                peak = min(0.8, max(vol, vol * 3))
+                r_start = max(0.0, dur - 5.0)
+                parts.append(f"[{music_idx}:a]volume='if(lt(t,{r_start:.2f}),{vol:.3f},"
+                             f"{vol:.3f}+({peak - vol:.3f})*(t-{r_start:.2f})/5)':eval=frame[mus]")
+            else:
+                parts.append(f"[{music_idx}:a]volume={vol:.3f}[mus]")
             parts.append("[voice][mus]amix=inputs=2:duration=first:dropout_transition=0[aout]")
             audio_map = ["-map", "[aout]"]
             audio_filter = []
+            if use_fade:
+                parts.append(f"[aout]afade=t=in:st=0:d=0.25,afade=t=out:st={max(0.0, dur - 0.3):.2f}:d=0.3[aoutf]")
+                audio_map = ["-map", "[aoutf]"]
         else:
             audio_map = ["-map", f"{voice_idx}:a:0"]
             audio_filter = ["-af", "loudnorm=I=-14:TP=-1.5:LRA=11"]
+            if use_fade:
+                audio_filter = ["-af", f"loudnorm=I=-14:TP=-1.5:LRA=11,afade=t=in:st=0:d=0.25,"
+                                       f"afade=t=out:st={max(0.0, dur - 0.3):.2f}:d=0.3"]
 
         # 7. Encode.
         cmd = ["ffmpeg", "-y", "-v", "error", *inputs,
