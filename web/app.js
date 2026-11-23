@@ -12,7 +12,7 @@ const state = {
   liveRegions: { facecam: null, game: null },
   editor: { jobId: null, idx: -1, clip: null, regions: { facecam: null, game: null }, words: [], previewTimer: null, previewSeq: 0, previewUrl: null },
   logoPath: null, musicPath: null,
-  liveId: null,
+  liveId: null, liveSig: null,
   jobTimer: null, liveTimer: null,
   uploadFile: null,
 };
@@ -702,7 +702,7 @@ function clipCard(job, clip, i) {
   } else if (clip.status === "error") {
     html += '<div class="error-banner">Clip failed: ' + esc(clip.error || "unknown error") + "</div>";
   } else {
-    html += '<div class="hint">Rendering… (' + esc(clip.status || "pending") + ")</div>";
+    html += '<div class="rendering-box"><span class="spin"></span>Rendering… (' + esc(clip.status || "pending") + ")</div>";
   }
   html += '<div class="clip-top"><div class="clip-title">' + esc(clip.title || ("Clip " + (i + 1))) + '</div>';
   const vs = clip.viral_score != null ? clip.viral_score : clip.score;
@@ -1110,7 +1110,7 @@ function renderLive(s) {
   st.className = "badge " + s.status;
   $("liveElapsed").textContent = fmtTime(s.elapsed);
   $("hypeFill").style.width = Math.max(0, Math.min(100, s.hype || 0)) + "%";
-  $("liveTitle").textContent = s.title || s.url || "";
+  $("liveTitle").textContent = (s.title || s.url || "") + (s.rec_height ? " · recording " + s.rec_height + "p" : "");
   const err = $("liveError");
   err.hidden = !s.error;
   err.textContent = s.error || "";
@@ -1120,6 +1120,16 @@ function renderLive(s) {
     $("clipNowBtn").disabled = true;
     $("liveStartBtn").disabled = false;
   }
+  // Rebuilding the grid on every poll recreates the <video> elements and
+  // restarts playback from 0 — only rebuild when the clips actually change.
+  const sig = (s.clips || []).map((c) => [c.file || "", c.status || "", c.title || ""].join("|")).join(";");
+  if (sig === state.liveSig) return;
+  state.liveSig = sig;
+  // Preserve any playing clip across the rebuild.
+  const playing = {};
+  document.querySelectorAll("#liveClipGrid video").forEach((v) => {
+    if (!v.paused && !v.ended) playing[v.getAttribute("src")] = v.currentTime;
+  });
   const grid = $("liveClipGrid");
   grid.innerHTML = "";
   (s.clips || []).forEach((clip, i) => {
@@ -1132,7 +1142,7 @@ function renderLive(s) {
     } else if (clip.status === "error") {
       html += '<div class="error-banner">Clip failed: ' + esc(clip.error || "") + "</div>";
     } else {
-      html += '<div class="hint">Rendering…</div>';
+      html += '<div class="rendering-box"><span class="spin"></span>Rendering…</div>';
     }
     html += '<div class="clip-top"><div class="clip-title">' + esc(clip.title || ("Live clip " + (i + 1))) + "</div></div>";
     if (clip.hook) html += '<div class="clip-hook">' + esc(clip.hook) + "</div>";
@@ -1142,6 +1152,10 @@ function renderLive(s) {
     html += '<div class="dl-row">' + dls.filter((d) => d[1]).map((d) => '<a class="btn" href="' + media(d[1]) + '" download>' + d[0] + "</a>").join("") + "</div>";
     card.innerHTML = html;
     grid.appendChild(card);
+  });
+  document.querySelectorAll("#liveClipGrid video").forEach((v) => {
+    const t = playing[v.getAttribute("src")];
+    if (t != null) { v.currentTime = t; v.play().catch(() => {}); }
   });
 }
 

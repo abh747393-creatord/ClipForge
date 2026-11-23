@@ -6,6 +6,7 @@
   --accent:#6c5ce7; --accent-press:#5a4bd1; --accent-soft:rgba(108,92,231,.16);
   --cyan:#00f0ff; --lime:#a3e635;
   --good:#2fbf71; --bad:#ff5c6c; --bad-soft:rgba(255,92,108,.12);
+  --muted:#9aa3b2; --ok:#2fbf71;
   --r-lg:16px; --r:12px; --r-sm:8px;
   color-scheme:dark;
 }
@@ -241,3 +242,27 @@ details summary{cursor:pointer;color:var(--accent);font-size:14px;padding:4px 0}
 #linkPreviewCard{margin-top:10px}
 #linkThumb{width:100%;display:block;border-radius:var(--r)}
 #newRegionWrap{margin:8px 0}
+
+/* ---------- polish pass (2026-11-23): depth, motion, rendering state ---------- */
+.card,.clip-card,.lib-row{box-shadow:0 1px 2px rgba(0,0,0,.35),0 8px 24px rgba(0,0,0,.18)}
+.clip-card{transition:border-color .15s ease,transform .15s ease}
+.clip-card:hover{border-color:var(--line-2);transform:translateY(-2px)}
+.clip-card video{box-shadow:inset 0 0 0 1px var(--line)}
+.btn{transition:border-color .15s ease,background .15s ease,transform .05s ease}
+.btn:active{transform:translateY(1px)}
+.btn.primary{box-shadow:0 4px 14px rgba(108,92,231,.35)}
+.nav-item{transition:background .15s ease,color .15s ease}
+.topbar{background:rgba(15,17,21,.85);backdrop-filter:blur(10px)}
+.progress-fill{background:linear-gradient(90deg,var(--accent),var(--cyan))}
+.badge.recording::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--bad);animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.rendering-box{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+  width:100%;aspect-ratio:9/16;max-height:420px;background:linear-gradient(160deg,#12151c,#0a0c10);
+  border:1px dashed var(--line-2);border-radius:var(--r);color:var(--dim);font-size:13px;font-weight:600}
+.spin{width:26px;height:26px;border-radius:50%;border:3px solid var(--line-2);border-top-color:var(--accent);animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+main::-webkit-scrollbar,.transcript-lines::-webkit-scrollbar,.ed-words::-webkit-scrollbar{width:10px}
+main::-webkit-scrollbar-thumb,.transcript-lines::-webkit-scrollbar-thumb,.ed-words::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:999px;border:2px solid var(--bg)}
+input[type=range]{cursor:pointer}
+details summary:hover{color:#b7aaff}
+.dl-row .btn:hover{background:var(--accent-soft)}

@@ -109,14 +109,14 @@ def _video_args():
     working hardware encoder is probed once, else libx264."""
     enc = (os.environ.get("CLIPFORGE_ENCODER") or "").strip() or _probe_encoder()
     if not enc:
-        return ["-c:v", "libx264", "-crf", "20", "-preset", "veryfast"]
+        return ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast"]
     if "nvenc" in enc:
-        return ["-c:v", enc, "-cq", "20"]
+        return ["-c:v", enc, "-cq", "18"]
     if "qsv" in enc:
-        return ["-c:v", enc, "-global_quality", "23"]
+        return ["-c:v", enc, "-global_quality", "21"]
     if "videotoolbox" in enc or "amf" in enc or "vaapi" in enc:
-        return ["-c:v", enc, "-b:v", "10M", "-maxrate", "14M", "-bufsize", "20M"]
-    return ["-c:v", enc, "-crf", "20", "-preset", "veryfast"]
+        return ["-c:v", enc, "-b:v", "12M", "-maxrate", "16M", "-bufsize", "24M"]
+    return ["-c:v", enc, "-crf", "18", "-preset", "veryfast"]
 
 
 def _check_sheet(mp4, dur, dest):

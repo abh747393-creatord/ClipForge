@@ -724,14 +724,18 @@ def resolve_live(url, height=1080) -> dict:
     if not i.get("is_live"):
         raise ValueError("not live")
     urls = []
+    height = int(i.get("height") or 0)
     if i.get("url"):
         urls.append(i["url"])
     for f in i.get("requested_formats") or []:
         if f.get("url"):
             urls.append(f["url"])
+            if not height and f.get("vcodec") not in (None, "none"):
+                height = int(f.get("height") or 0)
     if not urls:
         for f in reversed(i.get("formats") or []):
             if f.get("url") and f.get("protocol", "").startswith(("http", "https")):
                 urls.append(f["url"])
+                height = int(f.get("height") or 0)
                 break
-    return {"urls": urls, "title": i.get("title") or ""}
+    return {"urls": urls, "title": i.get("title") or "", "height": height}

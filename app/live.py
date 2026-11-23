@@ -141,6 +141,7 @@ class LiveSession:
             "hype": int(self.hype),
             "error": self.error,
             "title": self.title,
+            "rec_height": int(getattr(self, "rec_height", 0) or 0),
         }
 
     # ------------------------------------------------------------------ ingest
@@ -148,6 +149,7 @@ class LiveSession:
         try:
             resolved = media.resolve_live(self.url, height=int(self.options.get("quality") or 1080))
             self.title = resolved.get("title") or ""
+            self.rec_height = int(resolved.get("height") or 0)
             urls = list(resolved.get("urls") or [])
             if not urls:
                 raise RuntimeError("Could not resolve that live stream.")
